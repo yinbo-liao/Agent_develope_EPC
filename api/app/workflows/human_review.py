@@ -1,3 +1,15 @@
+"""Human-review decision processing with state, role and deadline guards.
+
+The API layer authenticates the caller and requires a reviewer role; this module
+enforces the run-level invariants so no other caller can bypass them:
+
+* the run must be waiting in REVIEWING state,
+* it must not already have a decision,
+* the reviewer must not be the requester (no self-approval),
+* the review deadline must not have passed,
+* exactly one decision is recorded and applied.
+"""
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -8,23 +20,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.websocket_manager import ws_manager
 from app.models.human_review import HumanReviewDecision
 from app.models.workflow import WorkflowRun
-from app.workflows.nodes import adjust_risk_bias, human_review_node
+from app.workflows.nodes import human_review_node
+from app.workflows.state import WorkflowStatus
 
 
-def _adjust_factor_bias(factor: str, outcome: str) -> None:
-    """Map a risk factor description back to its regex pattern and adjust bias."""
-    # Map known factor descriptions to their regex patterns
-    factor_to_pattern = {
-        "CRITICAL: Sensitive financial or personal data": r"\b(payment|credit.?card|ssn|social.security)\b",
-        "CRITICAL: Destructive operation requested": r"\b(drop|truncate|destroy)\b",
-        "CRITICAL: Privilege escalation language": r"\b(sudo|root|superuser)\b",
-        "HIGH: Deletion request": r"\b(delete|remove)\b",
-        "HIGH: Modification request": r"\b(update|modify|alter)\b",
-        "HIGH: Credential-related access": r"\b(secret|token|password|key)\b",
-    }
-    pattern = factor_to_pattern.get(factor)
-    if pattern:
-        adjust_risk_bias(pattern, outcome)
+class HumanReviewError(Exception):
+    """Domain error mapped to an HTTP status by the API layer."""
+
+    def __init__(self, message: str, status_code: int = 409) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def _aware(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
 
 
 async def process_human_decision(
@@ -35,19 +44,23 @@ async def process_human_decision(
     comment: str = "",
 ) -> WorkflowRun:
     result = await session.execute(select(WorkflowRun).where(WorkflowRun.id == task_id))
-    run = result.scalar_one()
+    run = result.scalar_one_or_none()
+    if run is None:
+        raise HumanReviewError("Workflow not found", 404)
+
+    if run.current_status != WorkflowStatus.REVIEWING.value or not run.is_human_review_needed:
+        raise HumanReviewError("Workflow is not awaiting human review", 409)
+    if run.human_decision is not None:
+        raise HumanReviewError("Workflow already has a decision", 409)
+    if reviewer_id == run.user_id:
+        raise HumanReviewError("A reviewer cannot approve their own workflow", 403)
+    if run.review_deadline is not None and datetime.now(timezone.utc) > _aware(run.review_deadline):
+        raise HumanReviewError("The review deadline has passed", 409)
 
     run.human_decision = decision
     run.human_comment = comment
     run.updated_at = datetime.now(timezone.utc)
-
-    # Adaptive risk: adjust pattern biases based on reviewer decision
-    if run.risk_level in ("critical", "high") and decision == "approved":
-        for factor in run.risk_factors:
-            _adjust_factor_bias(factor, "approved")
-    elif run.risk_level in ("low", "medium") and decision == "rejected":
-        for factor in run.risk_factors:
-            _adjust_factor_bias(factor, "rejected")
+    run.is_human_review_needed = False
 
     session.add(
         HumanReviewDecision(

@@ -34,6 +34,11 @@ class Settings(BaseSettings):
     ENABLE_TRACING: bool = True
     REQUESTS_PER_MINUTE: int = 120
 
+    METRICS_TOKEN: str | None = None
+    SEED_DEMO_USERS: bool = False
+    DEMO_USER_PASSWORD: str = "demo-pass-1234"
+    DEMO_REVIEWER_PASSWORD: str = "reviewer-pass-1234"
+
     MCP_POSTGRES_ENABLED: bool = True
     MCP_GITHUB_ENABLED: bool = False
     MCP_PUPPETEER_ENABLED: bool = False
@@ -63,23 +68,27 @@ class Settings(BaseSettings):
         if not self.is_production:
             return errors
 
-        insecure_defaults = {
-            "SECRET_KEY": "dev-secret-change-me-in-prod-override",
-            "DATABASE_URL": "changeme_in_production",
-            "REDIS_URL": "changeme",
-        }
-        for field_name, insecure_marker in insecure_defaults.items():
-            value = getattr(self, field_name, "")
-            if isinstance(value, str) and insecure_marker in value:
+        insecure_markers = (
+            "changeme",
+            "change_me",
+            "<change",
+            "dev-secret",
+            "test-secret",
+            "replace-me",
+            "placeholder",
+        )
+        for field_name in ("SECRET_KEY", "DATABASE_URL", "REDIS_URL"):
+            value = str(getattr(self, field_name, "")).lower()
+            if any(marker in value for marker in insecure_markers):
                 errors.append(
-                    f"{field_name} contains an insecure default value. "
+                    f"{field_name} contains a placeholder or insecure default. "
                     f"Set {field_name} to a production-safe value."
                 )
 
         if self.SECRET_KEY and len(self.SECRET_KEY) < 32:
-            errors.append(
-                "SECRET_KEY must be at least 32 characters in production."
-            )
+            errors.append("SECRET_KEY must be at least 32 characters in production.")
+        if self.SEED_DEMO_USERS:
+            errors.append("SEED_DEMO_USERS must be false in production.")
         return errors
 
 

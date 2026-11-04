@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 
+import { authFetch } from "../lib/auth";
 import { runtimeConfig } from "../lib/runtime";
 
 type CostStatus = {
@@ -12,7 +13,7 @@ type CostStatus = {
   budget_tier: string;
 };
 
-export function CostWidget({ userId }: { userId: string }) {
+export function CostWidget() {
   const [data, setData] = useState<CostStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -21,9 +22,7 @@ export function CostWidget({ userId }: { userId: string }) {
 
     const load = async () => {
       try {
-        const response = await fetch(
-          `${runtimeConfig.apiBase}/api/v1/cost/status?user_id=${encodeURIComponent(userId)}`,
-        );
+        const response = await authFetch(`${runtimeConfig.apiBase}/api/v1/cost/status`);
         if (!response.ok) {
           throw new Error("Failed to load cost status");
         }
@@ -45,11 +44,11 @@ export function CostWidget({ userId }: { userId: string }) {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [userId]);
+  }, []);
 
   if (error) {
     return (
-      <div className="rounded-2xl border border-red-200 bg-red-50 p-5 text-sm text-red-700">
+      <div className="rounded-2xl border border-red-200 bg-red-50 p-5 text-sm text-red-700" role="alert">
         {error}
       </div>
     );
@@ -57,7 +56,7 @@ export function CostWidget({ userId }: { userId: string }) {
 
   if (!data) {
     return (
-      <div className="rounded-2xl border border-neutral-200 bg-white p-5 shadow-soft">
+      <div className="rounded-2xl border border-neutral-200 bg-white p-5 text-sm text-neutral-500 shadow-soft">
         Loading cost status...
       </div>
     );

@@ -1,14 +1,66 @@
-# AI Agent Dev Strategy
+# AI Workflow Platform (demo)
 
-This repository now includes the initial monorepo scaffold for the multi-agent AI workflow platform described in [ai_agent_dev_strategy.md](file:///h:/Ai-Agent_dev_strategy/ai_agent_dev_strategy.md).
+A local demonstration of a multi-agent workflow platform: a FastAPI backend runs a
+deterministic workflow graph (validate → retrieve → assess risk → route → generate →
+human review), and a React dashboard streams progress over WebSocket with SSE fallback.
 
-The current focus is project architecture:
+This is a **demo build**: the model client is simulated, retrieval is keyword-based,
+and MCP tools are stubs. The security and delivery hardening in this branch (P0) is real.
 
-- `api/` for the FastAPI backend and tests
-- `frontend/` for the React application
-- `infrastructure/` for Docker, Kubernetes, and Terraform assets
-- `.claude/` for local agent configuration, skills, hooks, and policies
-- `docs/` for architecture decisions, runbooks, and API documentation
-- `scripts/` for migrations, backups, and security automation
+## Demo sign-in
 
-See [code_archtech.md](file:///h:/Ai-Agent_dev_strategy/code_archtech.md) for the concrete directory tree and scaffold notes.
+Authentication is required on every workflow, event and review endpoint. Two demo users are
+seeded on startup in development (`SEED_DEMO_USERS=true`):
+
+| User | Password | Role | Use |
+|---|---|---|---|
+| `demo` | `demo-pass-1234` | viewer | create and watch workflows |
+| `reviewer` | `reviewer-pass-1234` | reviewer | approve/reject CRITICAL runs |
+
+A reviewer cannot approve a run they requested, the run must still be in review, and the
+30-minute deadline is enforced. WebSocket/SSE connections use a two-minute, task-scoped
+ticket issued by `POST /api/v1/events/ticket/{task_id}`.
+
+## Quick start
+
+```bash
+docker compose up -d --build
+# app:      http://localhost:5173
+# API docs: http://localhost:8000/docs  (development only)
+# metrics:  http://localhost:8000/metrics
+```
+
+Without Docker:
+
+```bash
+cd api
+pip install -e ".[dev]"
+uvicorn app.main:app --reload
+# in another terminal
+cd frontend
+npm ci && npm run dev
+```
+
+Set `VITE_API_URL=http://localhost:8000` for the Vite dev server (docker-compose does).
+
+## What is enforced (P0 branch)
+
+- **AuthN/AuthZ**: JWT access tokens; owner-scoped workflow reads; role-gated human review;
+  no caller-supplied `user_id` or `reviewer_id`.
+- **Human review**: status, deadline, self-approval and duplicate-decision guards.
+- **Streams**: WebSocket/SSE require a short-lived task ticket; socket messages cannot approve runs.
+- **Surface hardening**: docs are development-only, `/metrics` is hidden in production unless
+  `METRICS_TOKEN` is set, HSTS in production, stricter CSP at the frontend proxy.
+- **Hook**: the Claude security hook now reads `tool_input` (the schema Claude Code sends) and
+  covers MultiEdit/PowerShell; negative tests assert it blocks.
+- **CI**: GitHub Actions runs ruff and pytest with coverage, and builds the frontend.
+
+## Known limitations (next phases)
+
+- The LLM remains simulated; retrieval is keyword matching and MCP tools are stubs.
+- Rate limiting is in-process; budgets are not yet transactional; OPA is not on the request path.
+- Execution uses in-process background tasks (no durable queue or idempotency key).
+- Helm chart is incomplete (no Service/frontend/Ingress; migrations are a no-op job).
+- Tests cover backend behaviour; there are no frontend or end-to-end tests yet.
+
+See `docs/` in the planning repository for the phase plan (P1–P4).

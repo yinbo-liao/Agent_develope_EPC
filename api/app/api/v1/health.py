@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 import redis.asyncio as redis
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Response, status
 
 from app.core.config import settings
 from app.core.database import check_database_health
@@ -33,13 +33,19 @@ async def health_check() -> dict[str, object]:
 
 
 @router.get("/ready", status_code=status.HTTP_200_OK)
-async def readiness_check() -> dict[str, object]:
+async def readiness_check(response: Response) -> dict[str, object]:
+    """Readiness requires the database; Redis is reported but non-fatal.
+
+    A Redis outage degrades realtime fan-out to local-only, so it must not evict
+    every pod from the service. A database outage must.
+    """
     database_ok = await check_database_health()
     redis_ok = await check_redis_health()
-    ready = database_ok and redis_ok
+    if not database_ok:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
 
     return {
-        "status": "ready" if ready else "degraded",
+        "status": "ready" if database_ok else "degraded",
         "checks": {"database": database_ok, "redis": redis_ok},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }

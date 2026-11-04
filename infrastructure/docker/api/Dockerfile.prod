@@ -10,11 +10,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
+# Build context is the repository root: docker build -f infrastructure/docker/api/Dockerfile.prod .
 COPY api/pyproject.toml ./pyproject.toml
 COPY api/README.md ./README.md
 RUN pip install --upgrade pip && pip install .
 
 COPY api/app ./app
+COPY api/alembic ./alembic
+COPY api/alembic.ini ./alembic.ini
 
 RUN useradd --create-home --shell /bin/bash aiwf && chown -R aiwf:aiwf /app
 USER aiwf

@@ -33,3 +33,6 @@ htmlcov/
 
 # Claude
 .claude/audit.jsonl
+.pytest-tmp/
+.npm-cache/
+*.tsbuildinfo

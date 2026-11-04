@@ -34,7 +34,7 @@ class AuditLogger:
             "session_id": data.get("session_id", "unknown"),
             "correlation_id": data.get("correlation_id", "unknown"),
             "tool_name": data.get("tool_name", "unknown"),
-            "params": self.sanitize(data.get("params", {})),
+            "params": self.sanitize(data.get("tool_input") or data.get("params") or {}),
             "result_status": data.get("result", {}).get("status", "unknown"),
             "duration_ms": data.get("duration_ms", 0),
         }

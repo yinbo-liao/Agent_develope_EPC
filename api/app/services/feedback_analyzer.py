@@ -9,7 +9,6 @@ from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.audit import MCPToolCallAudit
-from app.models.human_review import HumanReviewDecision
 from app.models.workflow import WorkflowRun
 
 logger = logging.getLogger(__name__)

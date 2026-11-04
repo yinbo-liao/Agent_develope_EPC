@@ -92,14 +92,29 @@ class SecurityFirewall:
         except json.JSONDecodeError:
             return {"block": True, "reason": "Invalid input JSON"}
 
-        tool_name = data.get("tool_name", "")
-        params = data.get("params", {})
+        # Claude Code sends the tool arguments under `tool_input`; older examples
+        # used `params`. Accept both so a hook upgrade never silently disables the
+        # checks, and fail closed when neither is a mapping.
+        tool_name = str(data.get("tool_name") or data.get("tool") or "")
+        raw_params = data.get("tool_input")
+        if raw_params is None:
+            raw_params = data.get("params")
+        if raw_params is None:
+            raw_params = {}
+        if not isinstance(raw_params, dict):
+            return {"block": True, "reason": "Malformed tool input"}
+        params: dict[str, Any] = raw_params
 
-        if tool_name == "Bash":
+        if tool_name in {"Bash", "PowerShell"}:
             self.check_command(str(params.get("command", "")))
         elif tool_name in {"Edit", "Write"}:
             self.check_path(str(params.get("path", params.get("file", ""))))
             self.check_content(str(params.get("content", params.get("text", ""))))
+        elif tool_name == "MultiEdit":
+            for edit in params.get("edits", []) or []:
+                if isinstance(edit, dict):
+                    self.check_path(str(edit.get("path", edit.get("file", ""))))
+                    self.check_content(str(edit.get("new_string", edit.get("content", ""))))
         elif tool_name == "SQL":
             self.check_content(str(params.get("query", "")))
 

@@ -1,11 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { authFetch } from "../lib/auth";
 import { runtimeConfig } from "../lib/runtime";
-import type { TransportType, WorkflowEvent, WorkflowState } from "../types/workflow";
+import type { WorkflowEvent, WorkflowState } from "../types/workflow";
 
-const MAX_RECONNECT_ATTEMPTS = 5;
-const BASE_DELAY_MS = 1000;
-const MAX_DELAY_MS = 30000;
+const STREAM_ERROR = "The live event stream could not be opened. Refresh to retry.";
 
 const emptyState = (taskId: string): WorkflowState => ({
   taskId,
@@ -22,58 +21,43 @@ const emptyState = (taskId: string): WorkflowState => ({
   connected: false,
 });
 
-function backoffDelay(attempt: number): number {
-  const exponential = Math.min(MAX_DELAY_MS, BASE_DELAY_MS * Math.pow(2, attempt));
-  // Add jitter: ±25%
-  const jitter = exponential * 0.25 * (Math.random() * 2 - 1);
-  return Math.round(exponential + jitter);
+function parseEvent(raw: string): WorkflowEvent | null {
+  try {
+    return JSON.parse(raw) as WorkflowEvent;
+  } catch {
+    return null;
+  }
 }
 
-export function useWorkflowEvents(
-  taskId: string | null,
-  preferredTransport: TransportType = "auto",
-) {
+export function useWorkflowEvents(taskId: string | null, token: string) {
   const [state, setState] = useState<WorkflowState>(emptyState(taskId ?? ""));
-  const wsRef = useRef<WebSocket | null>(null);
-  const sseRef = useRef<EventSource | null>(null);
-  const reconnectAttemptRef = useRef(0);
-  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const socketRef = useRef<WebSocket | null>(null);
+  const sourceRef = useRef<EventSource | null>(null);
 
-  const disconnect = useCallback(() => {
-    if (reconnectTimerRef.current) {
-      clearTimeout(reconnectTimerRef.current);
-      reconnectTimerRef.current = null;
-    }
-    wsRef.current?.close();
-    sseRef.current?.close();
-    wsRef.current = null;
-    sseRef.current = null;
+  const closeStreams = useCallback(() => {
+    socketRef.current?.close();
+    sourceRef.current?.close();
+    socketRef.current = null;
+    sourceRef.current = null;
   }, []);
 
-  const appendStep = useCallback((event: WorkflowEvent) => {
-    if (!event.stepName && !event.currentStep) {
-      return;
-    }
+  const applyEvent = useCallback((event: WorkflowEvent) => {
     setState((current) => {
-      const stepName = event.stepName ?? event.currentStep ?? "unknown";
-      const next = {
-        stepName,
-        status: event.stepStatus ?? event.status ?? "updated",
-        timestamp: event.timestamp,
-      };
-      const alreadyPresent = current.steps.some(
-        (step) => step.stepName === next.stepName && step.status === next.status,
-      );
+      const stepName = event.stepName ?? event.currentStep;
+      const nextSteps =
+        stepName === undefined
+          ? current.steps
+          : current.steps.some((step) => step.stepName === stepName && step.status === event.stepStatus)
+            ? current.steps
+            : [
+                ...current.steps,
+                {
+                  stepName,
+                  status: event.stepStatus ?? event.status ?? "updated",
+                  timestamp: event.timestamp,
+                },
+              ];
       return {
-        ...current,
-        steps: alreadyPresent ? current.steps : [...current.steps, next],
-      };
-    });
-  }, []);
-
-  const processEvent = useCallback(
-    (event: WorkflowEvent) => {
-      setState((current) => ({
         ...current,
         taskId: event.taskId || current.taskId,
         status:
@@ -81,7 +65,7 @@ export function useWorkflowEvents(
             ? "error"
             : event.isHumanReviewNeeded
               ? "paused"
-              : (event.status as WorkflowState["status"]) || current.status,
+              : ((event.status as WorkflowState["status"]) ?? current.status),
         currentStep: event.currentStep ?? event.stepName ?? current.currentStep,
         finalResponse: event.finalResponse ?? current.finalResponse,
         error: event.error ?? current.error,
@@ -89,167 +73,134 @@ export function useWorkflowEvents(
         reviewData: event.reviewData ?? current.reviewData,
         totalTokens: event.totalTokens ?? current.totalTokens,
         totalCost: event.totalCost ?? current.totalCost,
+        steps: nextSteps,
         connected: true,
-      }));
-      appendStep(event);
-    },
-    [appendStep],
-  );
+      };
+    });
+  }, []);
 
-  const fetchState = useCallback(async () => {
+  const refresh = useCallback(async () => {
     if (!taskId) {
       return;
     }
-    const response = await fetch(`${runtimeConfig.apiBase}/api/v1/events/state/${taskId}`);
+    const response = await authFetch(`${runtimeConfig.apiBase}/api/v1/events/state/${taskId}`);
     if (!response.ok) {
       throw new Error("Failed to fetch workflow state");
     }
-    const event = (await response.json()) as WorkflowEvent;
-    processEvent(event);
-  }, [processEvent, taskId]);
+    applyEvent((await response.json()) as WorkflowEvent);
+  }, [applyEvent, taskId]);
 
   const sendResume = useCallback(
-    async (decision: "approved" | "rejected", reviewerId: string, comment: string) => {
+    async (decision: "approved" | "rejected", comment: string) => {
       if (!taskId) {
         return;
       }
-
-      const payload = {
-        type: "resume",
-        decision,
-        reviewerId,
-        comment,
-      };
-
-      if (wsRef.current?.readyState === WebSocket.OPEN) {
-        wsRef.current.send(JSON.stringify(payload));
-        return;
-      }
-
-      await fetch(`${runtimeConfig.apiBase}/api/v1/human-review/decide`, {
+      const response = await authFetch(`${runtimeConfig.apiBase}/api/v1/human-review/decide`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          task_id: taskId,
-          reviewer_id: reviewerId,
-          decision,
-          comment,
-        }),
+        body: JSON.stringify({ task_id: taskId, decision, comment }),
       });
-      await fetchState();
+      if (!response.ok) {
+        const detail = response.status === 403 ? "You are not allowed to decide this run."
+          : response.status === 409 ? "This run is no longer awaiting review."
+            : "The decision could not be recorded.";
+        setState((current) => ({ ...current, error: detail }));
+        return;
+      }
+      await refresh();
     },
-    [fetchState, taskId],
+    [refresh, taskId],
   );
 
   useEffect(() => {
     if (!taskId) {
-      setState(emptyState(""));
-      disconnect();
+      closeStreams();
       return;
     }
 
-    setState((current) => ({
-      ...emptyState(taskId),
-      steps: current.taskId === taskId ? current.steps : [],
-    }));
-    disconnect();
-    reconnectAttemptRef.current = 0;
+    let disposed = false;
+    setState(emptyState(taskId));
 
-    const scheduleReconnect = (
-      label: string,
-      connectFn: () => void,
-      maxAttempts: number = MAX_RECONNECT_ATTEMPTS,
-      onExhausted?: () => void,
-    ) => {
-      if (reconnectAttemptRef.current >= maxAttempts) {
-        reconnectAttemptRef.current = 0;
-        onExhausted?.();
+    const connectSse = (ticket: string) => {
+      if (disposed) {
         return;
       }
-      const delay = backoffDelay(reconnectAttemptRef.current);
-      reconnectAttemptRef.current += 1;
-      setState((current) => ({ ...current, transport: "connecting" }));
-      reconnectTimerRef.current = setTimeout(() => {
-        connectFn();
-      }, delay);
-    };
-
-    const connectSse = () => {
-      const sse = new EventSource(`${runtimeConfig.apiBase}/api/v1/events/sse/${taskId}`);
-      sseRef.current = sse;
-      setState((current) => ({ ...current, transport: "sse", connected: true }));
-      reconnectAttemptRef.current = 0;
-
-      sse.onmessage = (message) => {
-        processEvent(JSON.parse(message.data) as WorkflowEvent);
-      };
-      sse.onerror = () => {
-        sse.close();
-        setState((current) => ({ ...current, connected: false }));
-        // Attempt SSE reconnection with backoff
-        scheduleReconnect("SSE", connectSse);
-      };
-    };
-
-    const connectWebsocket = () => {
-      const transport: TransportType =
-        preferredTransport === "auto" ? "websocket" : preferredTransport;
-
-      if (transport === "sse") {
-        connectSse();
-        return;
-      }
-
-      const websocket = new WebSocket(
-        `${runtimeConfig.wsBase}/api/v1/events/ws/${taskId}`,
+      const source = new EventSource(
+        `${runtimeConfig.apiBase}/api/v1/events/sse/${taskId}?ticket=${encodeURIComponent(ticket)}`,
       );
-      wsRef.current = websocket;
-      setState((current) => ({ ...current, transport: "websocket" }));
-
-      websocket.onmessage = (message) => {
-        processEvent(JSON.parse(message.data) as WorkflowEvent);
+      sourceRef.current = source;
+      source.onopen = () => {
+        setState((current) => ({ ...current, transport: "sse", connected: true }));
       };
-      websocket.onopen = async () => {
-        reconnectAttemptRef.current = 0;
-        setState((current) => ({ ...current, connected: true }));
-        try {
-          await fetchState();
-        } catch {
-          // State will arrive via realtime events.
+      source.onmessage = (message) => {
+        const event = parseEvent(message.data);
+        if (event) {
+          applyEvent(event);
         }
       };
-      websocket.onerror = () => {
-        websocket.close();
-      };
-      websocket.onclose = () => {
-        setState((current) => ({ ...current, connected: false }));
-        if (preferredTransport === "websocket") {
-          // Retry WebSocket with backoff, then give up
-          scheduleReconnect("WebSocket", connectWebsocket, MAX_RECONNECT_ATTEMPTS);
-          return;
+      source.onerror = () => {
+        source.close();
+        if (!disposed) {
+          setState((current) => ({ ...current, connected: false, error: STREAM_ERROR }));
         }
-        // Auto mode: retry WS a few times then fall back to SSE
-        scheduleReconnect("WebSocket", connectWebsocket, MAX_RECONNECT_ATTEMPTS, () => {
-          connectSse();
-        });
       };
     };
 
-    // Initial fetch — only needed as bootstrap (WebSocket onopen also refreshes)
-    void fetchState().catch(() => undefined);
-    connectWebsocket();
+    const connectWebSocket = (ticket: string) => {
+      if (disposed) {
+        return;
+      }
+      const socket = new WebSocket(
+        `${runtimeConfig.wsBase}/api/v1/events/ws/${taskId}?ticket=${encodeURIComponent(ticket)}`,
+      );
+      socketRef.current = socket;
+      socket.onopen = () => {
+        setState((current) => ({ ...current, transport: "websocket", connected: true }));
+      };
+      socket.onmessage = (message) => {
+        const event = parseEvent(String(message.data));
+        if (event) {
+          applyEvent(event);
+        }
+      };
+      socket.onclose = () => {
+        if (!disposed) {
+          connectSse(ticket);
+        }
+      };
+    };
+
+    const start = async () => {
+      try {
+        const response = await authFetch(
+          `${runtimeConfig.apiBase}/api/v1/events/ticket/${taskId}`,
+          { method: "POST" },
+        );
+        if (!response.ok) {
+          throw new Error(STREAM_ERROR);
+        }
+        const { ticket } = (await response.json()) as { ticket: string };
+        if (!disposed) {
+          connectWebSocket(ticket);
+        }
+      } catch {
+        if (!disposed) {
+          setState((current) => ({ ...current, connected: false, error: STREAM_ERROR }));
+        }
+      }
+    };
+
+    void refresh().catch(() => undefined);
+    void start();
 
     return () => {
-      disconnect();
+      disposed = true;
+      closeStreams();
     };
-  }, [disconnect, fetchState, preferredTransport, processEvent, taskId]);
+  }, [applyEvent, closeStreams, refresh, taskId, token]);
 
   return useMemo(
-    () => ({
-      state,
-      sendResume,
-      refresh: fetchState,
-    }),
-    [fetchState, sendResume, state],
+    () => ({ state, sendResume, refresh }),
+    [refresh, sendResume, state],
   );
 }
