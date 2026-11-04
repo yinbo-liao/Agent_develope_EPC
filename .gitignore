@@ -36,3 +36,4 @@ htmlcov/
 .pytest-tmp/
 .npm-cache/
 *.tsbuildinfo
+pytest-of-*/
