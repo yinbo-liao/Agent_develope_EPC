@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.services.cost_governor import BUDGET_CONFIGS, BudgetTier, CostGovernor
+from app.services.cost_governor import BudgetTier, CostGovernor
 
 
 @pytest.mark.anyio

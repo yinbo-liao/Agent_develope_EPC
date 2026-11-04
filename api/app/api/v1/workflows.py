@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db_session
@@ -13,13 +13,15 @@ from app.core.dead_letter import (
     mark_replayed as dlq_mark_replayed,
     serialize_entry as dlq_serialize,
 )
-from app.core.deps import get_current_user, get_optional_user
+from app.core.deps import get_current_user
 from app.core.websocket_manager import ws_manager
 from app.models.workflow import WorkflowRun
 from app.workflows.runner import run_workflow_in_new_session
 from app.workflows.state import WorkflowCreateRequest, WorkflowDetail, WorkflowSummary
 
 router = APIRouter(prefix="/workflows", tags=["Workflows"])
+
+CURRENT_USER = dict[str, object]
 
 
 def to_summary(run: WorkflowRun) -> WorkflowSummary:
@@ -35,16 +37,13 @@ async def create_workflow(
     payload: WorkflowCreateRequest,
     background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_db_session),
-    current_user: dict[str, object] | None = Depends(get_optional_user),
+    current_user: CURRENT_USER = Depends(get_current_user),
 ) -> WorkflowSummary:
-    user_id = (
-        str(current_user["user_id"])
-        if current_user
-        else (payload.user_id or "anonymous")
-    )
+    # Identity comes only from the verified token. A user_id in the body is rejected
+    # by the request schema (extra="forbid") and can never override this value.
     workflow = WorkflowRun(
         id=str(uuid.uuid4()),
-        user_id=user_id,
+        user_id=str(current_user["user_id"]),
         session_id=payload.session_id,
         input_query=payload.input_query,
         token_budget=payload.token_budget,
@@ -72,22 +71,17 @@ async def create_workflow(
 async def list_workflows(
     offset: int = 0,
     limit: int = 20,
-    user_id: str | None = None,
     session: AsyncSession = Depends(get_db_session),
-    current_user: dict[str, object] | None = Depends(get_optional_user),
+    current_user: CURRENT_USER = Depends(get_current_user),
 ) -> dict[str, object]:
     limit = min(limit, 100)
-    effective_user = (
-        str(current_user["user_id"]) if current_user else (user_id or "anonymous")
-    )
+    effective_user = str(current_user["user_id"])
 
-    count_stmt = select(WorkflowRun).where(WorkflowRun.user_id == effective_user)
-    count_result = await session.execute(count_stmt)
-    total = len(count_result.scalars().all())
-
+    owned = WorkflowRun.user_id == effective_user
+    total = await session.scalar(select(func.count()).select_from(WorkflowRun).where(owned))
     stmt = (
         select(WorkflowRun)
-        .where(WorkflowRun.user_id == effective_user)
+        .where(owned)
         .order_by(WorkflowRun.created_at.desc())
         .offset(offset)
         .limit(limit)
@@ -97,7 +91,7 @@ async def list_workflows(
 
     return {
         "items": [to_summary(run) for run in runs],
-        "total": total,
+        "total": int(total or 0),
         "offset": offset,
         "limit": limit,
     }
@@ -107,14 +101,17 @@ async def list_workflows(
 async def get_workflow(
     task_id: str,
     session: AsyncSession = Depends(get_db_session),
-    current_user: dict[str, object] | None = Depends(get_optional_user),
+    current_user: CURRENT_USER = Depends(get_current_user),
 ) -> WorkflowDetail:
-    result = await session.execute(select(WorkflowRun).where(WorkflowRun.id == task_id))
+    result = await session.execute(
+        select(WorkflowRun).where(
+            WorkflowRun.id == task_id,
+            WorkflowRun.user_id == str(current_user["user_id"]),
+        )
+    )
     run = result.scalar_one_or_none()
     if run is None:
-        raise HTTPException(status_code=404, detail="Workflow not found")
-    # If authenticated, enforce ownership; if not, allow access (dev mode)
-    if current_user and run.user_id != str(current_user["user_id"]):
+        # 404, not 403: do not reveal whether another user's run exists.
         raise HTTPException(status_code=404, detail="Workflow not found")
     return to_detail(run)
 
@@ -123,14 +120,13 @@ async def get_workflow(
 # Dead Letter Queue
 # ---------------------------------------------------------------------------
 
+
 @router.get("/dlq/entries", response_model=list[dict[str, object]])
 async def list_dlq_entries(
-    user_id: str | None = None,
-    current_user: dict[str, object] | None = Depends(get_optional_user),
+    current_user: CURRENT_USER = Depends(get_current_user),
 ) -> list[dict[str, object]]:
-    """List dead-letter-queued workflows."""
-    effective_user = str(current_user["user_id"]) if current_user else (user_id or "anonymous")
-    return dlq_list(user_id=effective_user)
+    """List dead-letter-queued workflows owned by the caller."""
+    return dlq_list(user_id=str(current_user["user_id"]))
 
 
 @router.post("/dlq/{dlq_id}/replay", status_code=status.HTTP_202_ACCEPTED)
@@ -138,13 +134,11 @@ async def replay_dlq_entry(
     dlq_id: str,
     background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_db_session),
-    current_user: dict[str, object] | None = Depends(get_optional_user),
+    current_user: CURRENT_USER = Depends(get_current_user),
 ) -> dict[str, object]:
     """Replay a dead-lettered workflow as a new workflow run."""
     entry = dlq_get(dlq_id)
-    if entry is None:
-        raise HTTPException(status_code=404, detail="DLQ entry not found")
-    if entry.get("user_id") != str(current_user["user_id"]):
+    if entry is None or entry.get("user_id") != str(current_user["user_id"]):
         raise HTTPException(status_code=404, detail="DLQ entry not found")
 
     payload = dlq_serialize(entry)

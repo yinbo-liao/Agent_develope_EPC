@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import os
 import sys
-import tempfile
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
@@ -178,6 +176,29 @@ def viewer_auth_headers(test_settings: Any) -> dict[str, str]:
 
     token = create_access_token(
         subject="viewer-user-id",
+        extra_claims={"role": "viewer", "tier": "free"},
+    )
+    return {"Authorization": f"Bearer {token}"}
+
+@pytest.fixture
+def reviewer_auth_headers(test_settings: Any) -> dict[str, str]:
+    """Return Authorization headers for a reviewer-role user (human review)."""
+    from app.security.auth import create_access_token  # noqa: E402
+
+    token = create_access_token(
+        subject="reviewer-user-id",
+        extra_claims={"role": "reviewer", "tier": "starter"},
+    )
+    return {"Authorization": f"Bearer {token}"}
+
+
+@pytest.fixture
+def other_user_auth_headers(test_settings: Any) -> dict[str, str]:
+    """Return Authorization headers for a second, unrelated viewer."""
+    from app.security.auth import create_access_token  # noqa: E402
+
+    token = create_access_token(
+        subject="other-user-id",
         extra_claims={"role": "viewer", "tier": "free"},
     )
     return {"Authorization": f"Bearer {token}"}

@@ -12,9 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import sys
 import uuid
-from datetime import datetime, timezone
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,10 +56,9 @@ async def run_workflow(
     cost_limit: float,
 ) -> int:
     """Create and execute a workflow, streaming progress to stdout."""
-    from app.core.config import settings as app_settings
     from app.models.workflow import WorkflowRun
     from app.core.database import SessionLocal
-    from app.workflows.runner import execute_workflow, broadcast_workflow_snapshot
+    from app.workflows.runner import execute_workflow
 
     task_id = str(uuid.uuid4())
 
@@ -89,12 +86,12 @@ async def run_workflow(
         run = await execute_workflow(session, task_id)
         await session.refresh(run)
 
-        print(f"\nResult:")
+        print("\nResult:")
         print(f"  Status:       {run.current_status}")
         print(f"  Risk Level:   {run.risk_level}")
         print(f"  Current Step: {run.current_step}")
         if run.risk_factors:
-            print(f"  Risk Factors:")
+            print("  Risk Factors:")
             for factor in run.risk_factors:
                 print(f"    - {factor}")
         if run.final_response:

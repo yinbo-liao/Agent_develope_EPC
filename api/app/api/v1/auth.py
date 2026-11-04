@@ -6,12 +6,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db_session
+from app.core.deps import get_current_user
 from app.models.user import User
 from app.security.auth import (
     create_access_token,
     create_refresh_token,
     decode_token,
-    hash_password,
     verify_password,
 )
 
@@ -26,6 +26,12 @@ class TokenRequest(BaseModel):
 class TokenResponse(BaseModel):
     access_token: str
     refresh_token: str
+
+
+class MeResponse(BaseModel):
+    user_id: str
+    role: str
+    tier: str
     token_type: str = "bearer"
 
 
@@ -87,3 +93,13 @@ async def refresh_token(
     access_token = create_access_token(subject=user.id, extra_claims=extra)
     new_refresh = create_refresh_token(subject=user.id)
     return TokenResponse(access_token=access_token, refresh_token=new_refresh)
+@router.get("/me", response_model=MeResponse, status_code=status.HTTP_200_OK)
+async def current_user_info(
+    current_user: dict[str, object] = Depends(get_current_user),
+) -> MeResponse:
+    """Return the authenticated identity encoded in the access token."""
+    return MeResponse(
+        user_id=str(current_user["user_id"]),
+        role=str(current_user.get("role", "viewer")),
+        tier=str(current_user.get("tier", "starter")),
+    )

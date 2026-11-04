@@ -90,6 +90,13 @@ tests/security/               Firewall hook tests
 api/.env.example              Environment variable template for local development
 ```
 
+## Demo authentication
+
+Every workflow, event and review endpoint requires a JWT. Development seeds two users
+(`SEED_DEMO_USERS=true`): `demo` / `demo-pass-1234` (viewer) and `reviewer` /
+`reviewer-pass-1234` (reviewer). The frontend signs in via `POST /api/v1/auth/token` and
+sends `Authorization: Bearer`; WebSocket/SSE use a task-scoped ticket from
+`POST /api/v1/events/ticket/{task_id}`.
 ## Commands
 
 ### Backend (from `api/`)
@@ -134,8 +141,8 @@ docker compose up -d postgres redis opa  # Infrastructure only
 docker compose logs -f backend    # Tail backend logs
 
 # Production builds
-docker build -f infrastructure/docker/api/Dockerfile.prod -t aiwf-api ./api
-docker build -f infrastructure/docker/frontend/Dockerfile.prod -t aiwf-frontend ./frontend
+docker build -f infrastructure/docker/api/Dockerfile.prod -t aiwf-api .
+docker build -f infrastructure/docker/frontend/Dockerfile.prod -t aiwf-frontend .
 ```
 
 ### Kubernetes (Helm)
@@ -175,18 +182,19 @@ The `.claude/agents/` directory defines five agent roles used by Claude Code's a
 | `GET` | `/health` | Service health |
 | `GET` | `/health/ready` | Readiness (DB + Redis check) |
 | `POST` | `/api/v1/workflows` | Create and queue a workflow run |
-| `GET` | `/api/v1/workflows` | List workflow runs (filterable by `user_id`) |
+| `GET` | `/api/v1/workflows` | List the caller's workflow runs |
 | `GET` | `/api/v1/workflows/{task_id}` | Get workflow detail |
-| `POST` | `/api/v1/human-review/decide` | Approve/reject a paused workflow |
+| `POST` | `/api/v1/human-review/decide` | Approve/reject a paused workflow (reviewer role; no self-approval) |
 | `GET` | `/api/v1/events/state/{task_id}` | Get current workflow state snapshot |
-| `GET` | `/api/v1/events/sse/{task_id}` | SSE event stream for a workflow |
-| `WS` | `/api/v1/events/ws/{task_id}` | WebSocket event stream (supports `ping`, `status`, `resume` messages) |
-| `GET` | `/api/v1/cost/status?user_id=` | Cost governance status for a user |
+| `POST` | `/api/v1/events/ticket/{task_id}` | Issue a 2-minute, task-scoped stream ticket |
+| `GET` | `/api/v1/events/sse/{task_id}?ticket=` | SSE event stream for a workflow |
+| `WS` | `/api/v1/events/ws/{task_id}?ticket=` | WebSocket stream (`ping`, `status`; decisions are REST-only) |
+| `GET` | `/api/v1/cost/status` | Cost governance status for the authenticated caller |
 | `GET` | `/api/v1/mcp/health` | MCP server health status |
 | `GET` | `/api/v1/mcp/tools` | List available MCP tools |
 | `POST` | `/api/v1/mcp/invoke/{server}/{tool}` | Invoke an MCP tool |
 
-Prometheus metrics are exposed at `GET /metrics` (when `ENABLE_METRICS=true`). Key metrics: `llm_cost_usd_total` (by model), `mcp_tool_calls_total` (by server/tool/status).
+Prometheus metrics are exposed at `GET /metrics` when enabled; in production the endpoint is hidden unless `METRICS_TOKEN` is set, and scrapers must send `X-Metrics-Token`. API docs are served only when `ENVIRONMENT=development`. Key metrics: `llm_cost_usd_total` (by model), `mcp_tool_calls_total` (by server/tool/status).
 
 ## Configuration
 
@@ -198,5 +206,7 @@ All backend settings live in `api/app/core/config.py` using `pydantic-settings`.
 | `REDIS_URL` | redis://... | Redis for pub/sub |
 | `OPA_URL` | http://opa:8181 | OPA policy engine |
 | `ENVIRONMENT` | development | development/test/staging/production |
+| `SEED_DEMO_USERS` | false | Seed the demo requester/reviewer (development only) |
+| `METRICS_TOKEN` | unset | Required header value for `/metrics` in production |
 | `REQUESTS_PER_MINUTE` | 120 | Rate limit threshold |
 | `MCP_*_ENABLED` | varies | Toggle MCP server stubs |

@@ -4,7 +4,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class RiskLevel(str, Enum):
@@ -34,16 +34,22 @@ class WorkflowEvent(BaseModel):
 
 
 class WorkflowCreateRequest(BaseModel):
+    """Create a run. Identity comes from the token, never from the body."""
+
+    model_config = ConfigDict(extra="forbid")
+
     input_query: str = Field(min_length=3, max_length=10_000)
-    user_id: str | None = None  # Deprecated: overridden by JWT auth
     session_id: str | None = None
     token_budget: int = Field(default=10_000, ge=1000, le=200_000)
     cost_budget_usd: float = Field(default=5.0, ge=0.0, le=500.0)
 
 
 class WorkflowDecisionRequest(BaseModel):
+    """Decide a paused run. The reviewer identity comes from the token."""
+
+    model_config = ConfigDict(extra="forbid")
+
     task_id: str
-    reviewer_id: str
     decision: Literal["approved", "rejected"]
     comment: str = ""
 

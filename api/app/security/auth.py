@@ -71,3 +71,31 @@ def create_api_key() -> str:
 def hash_api_key(api_key: str) -> str:
     """Hash an API key for storage (prefix is preserved for identification)."""
     return pwd_context.hash(api_key)
+STREAM_TOKEN_EXPIRE_SECONDS = 120
+
+
+def create_stream_token(subject: str, task_id: str) -> str:
+    """Short-lived token authorising one WebSocket/SSE stream for one task."""
+    now = datetime.now(timezone.utc)
+    claims = {
+        "sub": subject,
+        "iat": now,
+        "exp": now + timedelta(seconds=STREAM_TOKEN_EXPIRE_SECONDS),
+        "jti": str(uuid.uuid4()),
+        "type": "stream",
+        "scope": f"stream:{task_id}",
+    }
+    return jwt.encode(claims, settings.SECRET_KEY, algorithm=ALGORITHM)
+
+
+def decode_stream_token(token: str, task_id: str) -> str:
+    """Validate a stream token and return its subject. Raises JWTError."""
+    claims = jwt.decode(token, settings.SECRET_KEY, algorithms=[ALGORITHM])
+    if claims.get("type") != "stream":
+        raise JWTError("not a stream token")
+    if claims.get("scope") != f"stream:{task_id}":
+        raise JWTError("stream token scope mismatch")
+    subject = claims.get("sub")
+    if not isinstance(subject, str) or subject == "":
+        raise JWTError("stream token missing subject")
+    return subject

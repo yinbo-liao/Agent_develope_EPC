@@ -6,8 +6,8 @@ import { StepTimeline } from "./StepTimeline";
 import { TransportIndicator } from "./TransportIndicator";
 import { useWorkflowEvents } from "../hooks/useWorkflowEvents";
 
-export function WorkflowDashboard({ taskId }: { taskId: string }) {
-  const { state, sendResume, refresh } = useWorkflowEvents(taskId);
+export function WorkflowDashboard({ taskId, token }: { taskId: string; token: string }) {
+  const { state, sendResume, refresh } = useWorkflowEvents(taskId, token);
 
   return (
     <ErrorBoundary>
@@ -63,14 +63,12 @@ export function WorkflowDashboard({ taskId }: { taskId: string }) {
             {state.isHumanReviewNeeded ? (
               <HumanReviewPanel
                 details={state.reviewData}
-                onDecision={(decision, reviewerId, comment) =>
-                  void sendResume(decision, reviewerId, comment)
-                }
+                onDecision={(decision, comment) => sendResume(decision, comment)}
               />
             ) : null}
 
             {state.error ? (
-              <div className="rounded-2xl border border-red-200 bg-red-50 p-5 text-sm text-red-700">
+              <div className="rounded-2xl border border-red-200 bg-red-50 p-5 text-sm text-red-700" role="alert">
                 {state.error}
               </div>
             ) : null}

@@ -4,7 +4,7 @@ from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db_session
-from app.core.deps import get_current_user, require_role
+from app.core.deps import require_role
 from app.services.feedback_analyzer import analyze_workflow_patterns
 
 router = APIRouter(prefix="/analytics", tags=["Analytics"])
