@@ -139,12 +139,13 @@ npm run dev          # Vite dev server on :5173
 npm run build        # TypeScript check + production build
 npm run typecheck    # tsc --noEmit only
 npm test             # Vitest unit tests
+npm run test:e2e      # Playwright smoke tests (requires compose stack)
 ```
 
 ### Evidence (from `api/`)
 
 ```bash
-python scripts/evidence.py record   --out evidence/backend.json --workflow backend --commit "$(git rev-parse HEAD)"   --coverage-xml coverage.xml --min-coverage 55   --check "ruff=ruff check ." --check "tests=pytest -q --cov=app --cov-report=xml"
+python scripts/evidence.py record   --out evidence/backend.json --workflow backend --commit "$(git rev-parse HEAD)"   --coverage-xml coverage.xml --min-coverage 70   --check "ruff=ruff check ." --check "tests=pytest -q --cov=app --cov-report=xml"
 python scripts/evidence.py verify evidence/backend.json --commit "$(git rev-parse HEAD)"
 ```
 

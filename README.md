@@ -78,8 +78,8 @@ npm run build
 CI records what it ran as a verifiable evidence bundle (`api/scripts/evidence.py`):
 required checks must pass, the commit must match and coverage must clear the floor.
 The workflow is staged at `ci/ci.yml` because the current token lacks the `workflow`
-scope; `docs/CI.md` has the one-command enablement. Backend coverage is 56% with a
-55% gate; the P3 target is 70%.
+scope; `docs/CI.md` has the one-command enablement. Backend coverage is 71% with a
+70% gate.
 
 ## Deployment
 
@@ -100,9 +100,9 @@ admin/admin by default). Metrics include HTTP latency/status, `workflow_jobs_tot
 
 - The LLM remains simulated; retrieval is keyword matching and MCP tools are stubs.
 - Rate limiting remains in-process (P2 moves it to Redis).
-- Remaining delivery work: Playwright E2E, coverage to 70%, real model adapter and the KPI/GATE_G contract.
+- Remaining delivery work: real model adapter, the KPI/GATE_G contract, and staging validation of the chart/migration hook.
 - CI is a template at `ci/ci.yml` until a token with the `workflow` scope enables it.
-- End-to-end (Playwright) tests are still missing; coverage is 57% (target 70%).
+- End-to-end (Playwright) tests live in `frontend/e2e`; they need the compose stack and a browser.
 - Backend and frontend unit tests exist; end-to-end (Playwright) coverage is still P3.
 
 See `docs/` in the planning repository for the phase plan (P1–P4).

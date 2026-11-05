@@ -35,7 +35,7 @@ python scripts/evidence.py record \
   --workflow backend \
   --commit "$(git rev-parse HEAD)" \
   --coverage-xml coverage.xml \
-  --min-coverage 55 \
+  --min-coverage 70 \
   --check "ruff=ruff check ." \
   --check "tests=pytest -q --cov=app --cov-report=xml" \
   --advisory "bandit=bandit -r app -q -ll"
