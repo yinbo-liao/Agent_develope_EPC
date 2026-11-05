@@ -37,3 +37,4 @@ htmlcov/
 .npm-cache/
 *.tsbuildinfo
 pytest-of-*/
+evidence/

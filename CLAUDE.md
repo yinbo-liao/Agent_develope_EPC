@@ -115,6 +115,9 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 # Run all tests
 pytest
 
+# Run with coverage
+pytest --cov=app --cov-report=term
+
 # Run a single test file
 pytest tests/unit/test_workflow_nodes.py
 
@@ -135,7 +138,17 @@ npm install
 npm run dev          # Vite dev server on :5173
 npm run build        # TypeScript check + production build
 npm run typecheck    # tsc --noEmit only
+npm test             # Vitest unit tests
 ```
+
+### Evidence (from `api/`)
+
+```bash
+python scripts/evidence.py record   --out evidence/backend.json --workflow backend --commit "$(git rev-parse HEAD)"   --coverage-xml coverage.xml --min-coverage 55   --check "ruff=ruff check ." --check "tests=pytest -q --cov=app --cov-report=xml"
+python scripts/evidence.py verify evidence/backend.json --commit "$(git rev-parse HEAD)"
+```
+
+See `docs/EVIDENCE.md`; CI template is `ci/ci.yml` and enablement is in `docs/CI.md`.
 
 ### Docker Compose (from repo root)
 
