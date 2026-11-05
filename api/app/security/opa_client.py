@@ -54,6 +54,30 @@ class OPAPolicyClient:
                 "input": payload,
             }
 
+    async def evaluate_mcp(self, role: str, server: str, tool: str) -> dict[str, Any]:
+        """Evaluate the runtime MCP policy for a user role. Fail closed."""
+        payload = {"role": role, "server": server, "tool": tool}
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.post(
+                    f"{self.opa_url}/v1/data/aiwf/mcp/allow",
+                    json={"input": payload},
+                )
+                response.raise_for_status()
+            allowed = bool(response.json().get("result", False))
+            return {
+                "allowed": allowed,
+                "violations": [] if allowed else [{"msg": "MCP policy denied"}],
+                "input": payload,
+            }
+        except httpx.HTTPError as exc:
+            logger.error("OPA MCP evaluation failed: %s", exc)
+            return {
+                "allowed": False,
+                "violations": [{"msg": "Policy engine unavailable - access denied"}],
+                "input": payload,
+            }
+
     async def check_scope(
         self,
         agent: str,

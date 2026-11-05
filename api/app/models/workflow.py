@@ -44,6 +44,7 @@ class WorkflowRun(Base):
     human_decision: Mapped[str | None] = mapped_column(String(32), nullable=True)
     human_comment: Mapped[str | None] = mapped_column(Text(), nullable=True)
     review_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    review_state_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(

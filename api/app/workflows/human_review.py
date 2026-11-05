@@ -17,9 +17,11 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.hashing import review_state_hash
 from app.core.websocket_manager import ws_manager
 from app.models.human_review import HumanReviewDecision
 from app.models.workflow import WorkflowRun
+from app.services.audit import append_audit
 from app.workflows.nodes import human_review_node
 from app.workflows.state import WorkflowStatus
 
@@ -57,6 +59,10 @@ async def process_human_decision(
     if run.review_deadline is not None and datetime.now(timezone.utc) > _aware(run.review_deadline):
         raise HumanReviewError("The review deadline has passed", 409)
 
+    current_state_hash = review_state_hash(run)
+    if run.review_state_hash is not None and run.review_state_hash != current_state_hash:
+        raise HumanReviewError("Workflow state changed since review began", 409)
+
     run.human_decision = decision
     run.human_comment = comment
     run.updated_at = datetime.now(timezone.utc)
@@ -75,6 +81,13 @@ async def process_human_decision(
     for key, value in updates.items():
         setattr(run, key, value)
 
+    await append_audit(
+        session,
+        actor=reviewer_id,
+        action="human_review.decide",
+        resource=task_id,
+        payload={"decision": decision, "state_hash": current_state_hash},
+    )
     await session.commit()
     await session.refresh(run)
     await ws_manager.broadcast(

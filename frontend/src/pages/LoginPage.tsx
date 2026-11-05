@@ -22,8 +22,11 @@ export function LoginPage({ onLogin }: { onLogin: (session: Session) => void }) 
       if (!response.ok) {
         throw new Error(response.status === 401 ? "Invalid username or password." : "Sign-in failed.");
       }
-      const payload = (await response.json()) as { access_token: string };
-      onLogin(saveSession(payload.access_token));
+      const payload = (await response.json()) as {
+        access_token: string;
+        refresh_token: string;
+      };
+      onLogin(saveSession(payload.access_token, payload.refresh_token));
     } catch (loginError) {
       setError(loginError instanceof Error ? loginError.message : "Sign-in failed.");
     } finally {
@@ -84,7 +87,9 @@ export function LoginPage({ onLogin }: { onLogin: (session: Session) => void }) 
           Demo users: <span className="font-mono">demo</span> /{" "}
           <span className="font-mono">demo-pass-1234</span> (requester) and{" "}
           <span className="font-mono">reviewer</span> /{" "}
-          <span className="font-mono">reviewer-pass-1234</span> (approver).
+          <span className="font-mono">reviewer-pass-1234</span> (approver), and{" "}
+          <span className="font-mono">admin</span> /{" "}
+          <span className="font-mono">admin-pass-1234</span> (governance).
         </p>
       </form>
     </main>

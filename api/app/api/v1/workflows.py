@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, status
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db_session
@@ -15,7 +16,9 @@ from app.core.dead_letter import (
 )
 from app.core.deps import get_current_user
 from app.core.websocket_manager import ws_manager
+from app.models.idempotency import IdempotencyKey
 from app.models.workflow import WorkflowRun
+from app.services.audit import append_audit
 from app.workflows.runner import run_workflow_in_new_session
 from app.workflows.state import WorkflowCreateRequest, WorkflowDetail, WorkflowSummary
 
@@ -32,26 +35,76 @@ def to_detail(run: WorkflowRun) -> WorkflowDetail:
     return WorkflowDetail.model_validate(run, from_attributes=True)
 
 
+async def _existing_idempotent_run(
+    session: AsyncSession, user_id: str, idempotency_key: str
+) -> WorkflowRun | None:
+    existing = await session.scalar(
+        select(IdempotencyKey).where(
+            IdempotencyKey.user_id == user_id,
+            IdempotencyKey.key == idempotency_key,
+        )
+    )
+    if existing is None:
+        return None
+    run = await session.get(WorkflowRun, existing.workflow_id)
+    return run if run is not None and run.user_id == user_id else None
+
+
 @router.post("", response_model=WorkflowSummary, status_code=status.HTTP_202_ACCEPTED)
 async def create_workflow(
     payload: WorkflowCreateRequest,
     background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_db_session),
     current_user: CURRENT_USER = Depends(get_current_user),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ) -> WorkflowSummary:
     # Identity comes only from the verified token. A user_id in the body is rejected
     # by the request schema (extra="forbid") and can never override this value.
+    user_id = str(current_user["user_id"])
+    if idempotency_key is not None:
+        idempotency_key = idempotency_key.strip()
+        if not idempotency_key or len(idempotency_key) > 128:
+            raise HTTPException(
+                status_code=422, detail="Idempotency-Key must be 1-128 characters"
+            )
+        replay = await _existing_idempotent_run(session, user_id, idempotency_key)
+        if replay is not None:
+            return to_summary(replay)
+
     workflow = WorkflowRun(
         id=str(uuid.uuid4()),
-        user_id=str(current_user["user_id"]),
+        user_id=user_id,
         session_id=payload.session_id,
         input_query=payload.input_query,
         token_budget=payload.token_budget,
         cost_budget_usd=payload.cost_budget_usd,
     )
     session.add(workflow)
-    await session.commit()
+    if idempotency_key is not None:
+        session.add(
+            IdempotencyKey(user_id=user_id, key=idempotency_key, workflow_id=workflow.id)
+        )
+    try:
+        await session.commit()
+    except IntegrityError:
+        # Concurrent duplicate: return the winner instead of creating a second run.
+        await session.rollback()
+        if idempotency_key is None:
+            raise
+        replay = await _existing_idempotent_run(session, user_id, idempotency_key)
+        if replay is None:
+            raise
+        return to_summary(replay)
     await session.refresh(workflow)
+
+    await append_audit(
+        session,
+        actor=user_id,
+        action="workflow.create",
+        resource=workflow.id,
+        payload={"idempotency_key": idempotency_key},
+    )
+    await session.commit()
 
     await ws_manager.broadcast(
         workflow.id,

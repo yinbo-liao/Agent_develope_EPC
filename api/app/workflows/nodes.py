@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.core.circuit_breaker import breaker_registry
+from app.core.hashing import review_state_hash
 from app.core.metrics import track_llm_cost
 from app.models.workflow import WorkflowRun
 from app.services.cost_governor import cost_governor
@@ -253,7 +254,7 @@ async def auto_generate_response(run: WorkflowRun) -> dict[str, Any]:
     model_name = str(model_choice["model"])
 
     # Check semantic cache before generating
-    cached_response = await check_cache(run.input_query, model_name)
+    cached_response = await check_cache(run.input_query, model_name, run.user_id, run.risk_level)
     if cached_response is not None:
         record_hit()
         await cost_governor.record_usage(
@@ -295,7 +296,7 @@ async def auto_generate_response(run: WorkflowRun) -> dict[str, Any]:
     track_llm_cost(str(response["model"]), float(response["cost_usd"]))
 
     # Store in semantic cache for future reuse
-    await store_cache(run.input_query, model_name, response)
+    await store_cache(run.input_query, model_name, response, scope=run.user_id, risk_level=run.risk_level)
 
     return {
         "current_step": "auto_generate_response",
@@ -431,5 +432,6 @@ async def human_review_node(run: WorkflowRun) -> dict[str, Any]:
         "current_status": WorkflowStatus.REVIEWING.value,
         "is_human_review_needed": True,
         "review_deadline": datetime.now(timezone.utc) + timedelta(minutes=30),
+        "review_state_hash": review_state_hash(run),
         "updated_at": datetime.now(timezone.utc),
     }

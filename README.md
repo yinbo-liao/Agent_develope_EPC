@@ -16,6 +16,7 @@ seeded on startup in development (`SEED_DEMO_USERS=true`):
 |---|---|---|---|
 | `demo` | `demo-pass-1234` | viewer | create and watch workflows |
 | `reviewer` | `reviewer-pass-1234` | reviewer | approve/reject CRITICAL runs |
+| `admin` | `admin-pass-1234` | admin | provision users, verify the audit chain |
 
 A reviewer cannot approve a run they requested, the run must still be in review, and the
 30-minute deadline is enforced. WebSocket/SSE connections use a two-minute, task-scoped
@@ -43,7 +44,7 @@ npm ci && npm run dev
 
 Set `VITE_API_URL=http://localhost:8000` for the Vite dev server (docker-compose does).
 
-## What is enforced (P0 branch)
+## What is enforced (P0 + P1)
 
 - **AuthN/AuthZ**: JWT access tokens; owner-scoped workflow reads; role-gated human review;
   no caller-supplied `user_id` or `reviewer_id`.
@@ -53,13 +54,18 @@ Set `VITE_API_URL=http://localhost:8000` for the Vite dev server (docker-compose
   `METRICS_TOKEN` is set, HSTS in production, stricter CSP at the frontend proxy.
 - **Hook**: the Claude security hook now reads `tool_input` (the schema Claude Code sends) and
   covers MultiEdit/PowerShell; negative tests assert it blocks.
+- **Governance (P1)**: append-only, hash-chained audit events with `GET /api/v1/audit/verify`;
+  issuer/audience-checked JWTs; refresh-token rotation with reuse detection and logout; admin-only
+  user provisioning; `Idempotency-Key` replay; decisions bound to the reviewed state hash;
+  OPA-evaluated MCP authorization; caller-scoped semantic cache with high-risk bypass.
 - **CI**: GitHub Actions runs ruff and pytest with coverage, and builds the frontend.
 
 ## Known limitations (next phases)
 
 - The LLM remains simulated; retrieval is keyword matching and MCP tools are stubs.
-- Rate limiting is in-process; budgets are not yet transactional; OPA is not on the request path.
-- Execution uses in-process background tasks (no durable queue or idempotency key).
+- Rate limiting and budget accounting are best-effort; atomic reservation and a durable
+  execution queue are the remaining P1.5/P2 items.
+- Execution still uses in-process background tasks; a crash can orphan a queued run.
 - Helm chart is incomplete (no Service/frontend/Ingress; migrations are a no-op job).
 - Tests cover backend behaviour; there are no frontend or end-to-end tests yet.
 

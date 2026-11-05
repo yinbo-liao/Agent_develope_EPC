@@ -29,6 +29,10 @@ _STOPWORDS = frozenset({
     "which", "who", "whom", "this", "that", "these", "those",
 })
 
+# Responses for these risk levels are never reused: a high-stakes answer must be
+# produced for the specific run, not served from another user's cache entry.
+_UNCACHEABLE_RISK_LEVELS = frozenset({"high", "critical"})
+
 
 def _normalize_query(query: str) -> str:
     """Normalize a query for caching: lowercase, strip punctuation, remove stopwords."""
@@ -42,6 +46,16 @@ def _normalize_query(query: str) -> str:
 
 def _query_hash(normalized: str) -> str:
     return hashlib.sha256(normalized.encode()).hexdigest()[:16]
+
+
+def _scope_hash(scope: str) -> str:
+    """Hash the tenant/user scope so cache keys cannot be guessed or injected."""
+    return hashlib.sha256(scope.encode()).hexdigest()[:16]
+
+
+def cache_key(scope: str, model: str, query: str) -> str:
+    """Return the tenant-scoped cache key for a query/model pair."""
+    return f"semantic:{_scope_hash(scope)}:{model}:{_query_hash(_normalize_query(query))}"
 
 
 async def _ensure_redis() -> bool:
@@ -58,26 +72,27 @@ async def _ensure_redis() -> bool:
     return _redis_available
 
 
-async def check_cache(query: str, model: str) -> dict[str, Any] | None:
-    """Check if a semantically similar query has a cached response.
-
-    Uses normalized exact-match hash as primary key, and keyword-overlap
-    set for fuzzy matching.
-    """
+async def check_cache(
+    query: str,
+    model: str,
+    scope: str,
+    risk_level: str = "low",
+) -> dict[str, Any] | None:
+    """Check the caller-scoped semantic cache. High-risk runs bypass it entirely."""
+    if risk_level in _UNCACHEABLE_RISK_LEVELS:
+        return None
     if not await _ensure_redis():
         return None
 
     normalized = _normalize_query(query)
-    if len(normalized) < 5:  # too short to cache meaningfully
+    if len(normalized) < 5:
         return None
 
-    qhash = _query_hash(normalized)
-    cache_key = f"semantic:{model}:{qhash}"
-
+    key = cache_key(scope, model, query)
     try:
-        cached = await _redis.get(cache_key)  # type: ignore[union-attr]
+        cached = await _redis.get(key)  # type: ignore[union-attr]
         if cached:
-            logger.info("Semantic cache HIT for query hash %s", qhash)
+            logger.info("Semantic cache HIT for scope %s", _scope_hash(scope))
             return json.loads(cached)
     except Exception:
         logger.debug("Semantic cache read error")
@@ -89,9 +104,13 @@ async def store_cache(
     query: str,
     model: str,
     response: dict[str, Any],
+    scope: str,
+    risk_level: str = "low",
     ttl: int = 3600,
 ) -> None:
-    """Store a query-response pair in the semantic cache."""
+    """Store a query-response pair under the caller's scope."""
+    if risk_level in _UNCACHEABLE_RISK_LEVELS:
+        return
     if not await _ensure_redis():
         return
 
@@ -99,12 +118,9 @@ async def store_cache(
     if len(normalized) < 5:
         return
 
-    qhash = _query_hash(normalized)
-    cache_key = f"semantic:{model}:{qhash}"
-
     try:
-        await _redis.set(cache_key, json.dumps(response, default=str), ex=ttl)  # type: ignore[union-attr]
-        logger.debug("Semantic cache stored for hash %s", qhash)
+        await _redis.set(cache_key(scope, model, query), json.dumps(response, default=str), ex=ttl)  # type: ignore[union-attr]
+        logger.debug("Semantic cache stored for scope %s", _scope_hash(scope))
     except Exception:
         logger.debug("Semantic cache write error")
 
