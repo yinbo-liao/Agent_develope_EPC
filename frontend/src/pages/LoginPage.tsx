@@ -87,7 +87,9 @@ export function LoginPage({ onLogin }: { onLogin: (session: Session) => void }) 
           Demo users: <span className="font-mono">demo</span> /{" "}
           <span className="font-mono">demo-pass-1234</span> (requester) and{" "}
           <span className="font-mono">reviewer</span> /{" "}
-          <span className="font-mono">reviewer-pass-1234</span> (approver).
+          <span className="font-mono">reviewer-pass-1234</span> (approver), and{" "}
+          <span className="font-mono">admin</span> /{" "}
+          <span className="font-mono">admin-pass-1234</span> (governance).
         </p>
       </form>
     </main>

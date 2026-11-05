@@ -1,11 +1,9 @@
 """Development-only demo user provisioning.
 
 The platform ships with no registration route by design. For a local demo we seed
-a requester and a reviewer so the human-review gate can be demonstrated without
-weakening authentication. Seeding is disabled in production by config validation.
 a requester, a reviewer and an admin so the governance gates can be demonstrated
 without weakening authentication. Seeding is disabled in production by config validation.
-from __future__ import annotations
+"""
 
 import logging
 import uuid
