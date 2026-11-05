@@ -1,20 +1,58 @@
 groups:
-  - name: aiwf_alerts
+  - name: aiwf-slo
     interval: 30s
     rules:
-      - alert: HighWorkflowErrorRate
-        expr: increase(http_requests_total{status=~"5.."}[5m]) > 5
+      - alert: AIWFServiceDown
+        expr: up{job="aiwf-backend"} == 0
         for: 2m
         labels:
-          severity: warning
+          severity: critical
         annotations:
-          summary: "Elevated backend 5xx rate"
-          description: "The backend returned more than five 5xx responses in five minutes."
+          summary: "AIWF backend is not scrapeable"
 
-      - alert: HighLLMCost
-        expr: llm_cost_usd_total > 25
+      - alert: AIWFHighErrorRate
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m]))
+            /
+          clamp_min(sum(rate(http_requests_total[5m])), 0.001) > 0.05
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "LLM cost is trending above the local warning budget"
+          summary: "AIWF 5xx ratio above 5%"
+
+      - alert: AIWFP95Latency
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (le)
+          ) > 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AIWF p95 latency above 2s"
+
+      - alert: AIWFQueueBacklog
+        expr: workflow_job_queue_depth > 100
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Workflow job queue is backing up"
+
+      - alert: AIWFJobFailures
+        expr: increase(workflow_jobs_total{status="failed"}[15m]) > 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Workflow jobs are failing"
+
+      - alert: AIWFCostBurn
+        expr: sum(rate(llm_cost_usd_total[5m])) * 60 > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "LLM spend is above $1/minute"

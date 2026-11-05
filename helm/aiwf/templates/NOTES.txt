@@ -1,0 +1,13 @@
+{{- if .Values.ingress.enabled }}
+Application:
+{{- range .Values.ingress.hosts }}
+  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ .host }}
+{{- end }}
+{{- end }}
+
+Backend health: /health and /health/ready
+Prometheus metrics: /metrics (set METRICS_TOKEN in the secret when exposed)
+
+This chart expects an external PostgreSQL and Redis. Provide them in the secret
+`{{ include "aiwf.secretName" . }}` with keys SECRET_KEY, DATABASE_URL and REDIS_URL.
+Migrations run as a pre-install/pre-upgrade hook using `alembic upgrade head`.

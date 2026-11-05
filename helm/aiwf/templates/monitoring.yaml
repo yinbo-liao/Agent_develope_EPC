@@ -1,0 +1,51 @@
+{{- if .Values.monitoring.serviceMonitor.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "aiwf.fullname" . }}-backend
+  labels:
+    {{- include "aiwf.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "aiwf.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: backend
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: {{ .Values.monitoring.serviceMonitor.interval }}
+{{- end }}
+{{- if .Values.monitoring.prometheusRule.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "aiwf.fullname" . }}-slo
+  labels:
+    {{- include "aiwf.labels" . | nindent 4 }}
+spec:
+  groups:
+    - name: aiwf.slo
+      rules:
+        - alert: AIWFHighErrorRate
+          expr: sum(rate(http_requests_total{status=~"5.."}[5m])) / clamp_min(sum(rate(http_requests_total[5m])), 0.001) > 0.05
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "AIWF 5xx ratio above 5%"
+        - alert: AIWFQueueBacklog
+          expr: workflow_job_queue_depth > 100
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Workflow job queue is backing up"
+        - alert: AIWFJobFailures
+          expr: increase(workflow_jobs_total{status="failed"}[15m]) > 3
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Workflow jobs are failing"
+{{- end }}

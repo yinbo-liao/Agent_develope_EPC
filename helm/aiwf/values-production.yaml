@@ -1,21 +1,74 @@
 backend:
-  replicaCount: 2
+  replicaCount: 3
   image:
-    repository: aiwf/backend
-    tag: latest
+    repository: ghcr.io/example/aiwf-backend
+    # Prefer a digest for releases: sha256:...
+    tag: ""
+    digest: ""
   service:
     port: 8000
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 12
+    targetCPUUtilizationPercentage: 65
+  env:
+    ENVIRONMENT: production
+    ENABLE_METRICS: "true"
+    ENABLE_TRACING: "true"
+    OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector.observability:4317"
+    OPA_URL: "http://opa.aiwf.svc.cluster.local:8181"
+    SEED_DEMO_USERS: "false"
+    WORKER_ENABLED: "true"
+    JOB_MAX_ATTEMPTS: "3"
+    CORS_ORIGINS: '["https://aiwf.example.com"]'
 
 frontend:
-  replicaCount: 2
+  replicaCount: 3
   image:
-    repository: aiwf/frontend
-    tag: latest
+    repository: ghcr.io/example/aiwf-frontend
+    tag: ""
+    digest: ""
   service:
     port: 8080
 
-monitoring:
+secrets:
+  create: false
+  existingSecret: aiwf-secrets
+
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - host: aiwf.example.com
+      paths:
+        - path: /api
+          pathType: Prefix
+          service: backend
+        - path: /health
+          pathType: Prefix
+          service: backend
+        - path: /
+          pathType: Prefix
+          service: frontend
+  tls:
+    - secretName: aiwf-tls
+      hosts:
+        - aiwf.example.com
+
+migration:
+  enabled: true
+  backoffLimit: 3
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+networkPolicy:
   enabled: true
 
-networkPolicies:
-  enabled: true
+monitoring:
+  serviceMonitor:
+    enabled: false
+  prometheusRule:
+    enabled: false
