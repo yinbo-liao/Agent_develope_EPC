@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,7 +19,7 @@ from app.core.websocket_manager import ws_manager
 from app.models.idempotency import IdempotencyKey
 from app.models.workflow import WorkflowRun
 from app.services.audit import append_audit
-from app.workflows.runner import run_workflow_in_new_session
+from app.services.job_queue import enqueue_job
 from app.workflows.state import WorkflowCreateRequest, WorkflowDetail, WorkflowSummary
 
 router = APIRouter(prefix="/workflows", tags=["Workflows"])
@@ -53,7 +53,6 @@ async def _existing_idempotent_run(
 @router.post("", response_model=WorkflowSummary, status_code=status.HTTP_202_ACCEPTED)
 async def create_workflow(
     payload: WorkflowCreateRequest,
-    background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_db_session),
     current_user: CURRENT_USER = Depends(get_current_user),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
@@ -80,6 +79,7 @@ async def create_workflow(
         cost_budget_usd=payload.cost_budget_usd,
     )
     session.add(workflow)
+    await enqueue_job(session, workflow.id)
     if idempotency_key is not None:
         session.add(
             IdempotencyKey(user_id=user_id, key=idempotency_key, workflow_id=workflow.id)
@@ -116,7 +116,6 @@ async def create_workflow(
         },
     )
 
-    background_tasks.add_task(run_workflow_in_new_session, workflow.id)
     return to_summary(workflow)
 
 
@@ -185,7 +184,6 @@ async def list_dlq_entries(
 @router.post("/dlq/{dlq_id}/replay", status_code=status.HTTP_202_ACCEPTED)
 async def replay_dlq_entry(
     dlq_id: str,
-    background_tasks: BackgroundTasks,
     session: AsyncSession = Depends(get_db_session),
     current_user: CURRENT_USER = Depends(get_current_user),
 ) -> dict[str, object]:
@@ -203,8 +201,8 @@ async def replay_dlq_entry(
         cost_budget_usd=payload["cost_budget_usd"],
     )
     session.add(workflow)
+    await enqueue_job(session, workflow.id)
     await session.commit()
     await session.refresh(workflow)
     dlq_mark_replayed(dlq_id)
-    background_tasks.add_task(run_workflow_in_new_session, workflow.id)
     return {"status": "replayed", "new_task_id": workflow.id}

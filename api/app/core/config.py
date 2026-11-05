@@ -37,6 +37,11 @@ class Settings(BaseSettings):
     JWT_ISSUER: str = "aiwf"
     JWT_AUDIENCE: str = "aiwf-api"
     MCP_POLICY_ENFORCE: bool = True
+    WORKER_ENABLED: bool = True
+    WORKER_POLL_SECONDS: float = 2.0
+    JOB_VISIBILITY_TIMEOUT_SECONDS: int = 300
+    JOB_MAX_ATTEMPTS: int = 3
+    JOB_SWEEP_SECONDS: float = 30.0
 
     METRICS_TOKEN: str | None = None
     SEED_DEMO_USERS: bool = False

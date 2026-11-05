@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,11 +14,14 @@ from app.core.database import close_db, init_db
 from app.core.logging import setup_logging
 from app.core.mcp_client import mcp_tool_manager
 from app.core.metrics import setup_metrics
+from app.core.seed import seed_demo_users
 from app.core.tracing import tracing_manager
 from app.core.websocket_manager import ws_manager
 from app.middleware.correlation import CorrelationIdMiddleware
+from app.middleware.metrics_auth import MetricsAuthMiddleware
 from app.middleware.rate_limit import RateLimitMiddleware
 from app.middleware.security import SecurityHeadersMiddleware
+from app.services.worker import WorkflowWorker
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -37,11 +41,24 @@ if _production_errors:
 async def lifespan(_: FastAPI):
     logger.info("Starting backend services")
     await init_db()
+    await seed_demo_users()
     await mcp_tool_manager.initialize()
     await ws_manager.connect()
+
+    worker: WorkflowWorker | None = None
+    worker_task: asyncio.Task[None] | None = None
+    if settings.WORKER_ENABLED:
+        worker = WorkflowWorker()
+        worker_task = asyncio.create_task(worker.run_forever())
     try:
         yield
     finally:
+        if worker is not None:
+            worker.stop()
+        if worker_task is not None:
+            worker_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await worker_task
         await ws_manager.disconnect()
         await mcp_tool_manager.close()
         await close_db()
@@ -52,8 +69,8 @@ def create_application() -> FastAPI:
     app = FastAPI(
         title=settings.APP_NAME,
         version=settings.APP_VERSION,
-        docs_url="/docs" if not settings.is_production else None,
-        redoc_url="/redoc" if not settings.is_production else None,
+        docs_url="/docs" if settings.ENVIRONMENT == "development" else None,
+        redoc_url="/redoc" if settings.ENVIRONMENT == "development" else None,
         lifespan=lifespan,
     )
 
@@ -69,6 +86,7 @@ def create_application() -> FastAPI:
         expose_headers=["X-Correlation-ID"],
     )
     app.add_middleware(RateLimitMiddleware)
+    app.add_middleware(MetricsAuthMiddleware)
 
     if settings.ENABLE_METRICS:
         setup_metrics(app)

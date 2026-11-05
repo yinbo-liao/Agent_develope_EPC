@@ -169,12 +169,14 @@ pytest tests/security/test_firewall.py   # Run security firewall tests
 - **Vector store is keyword-based**: `retrieve_context()` in `vector_store.py` extracts topic keywords rather than performing real embeddings search
 - **MCP tools are fallback stubs**: `ResilientMCPClient` returns placeholder results for all MCP servers unless explicitly enabled via settings
 - **Human review deadline**: 30-minute window; the workflow remains in REVIEWING status until a decision is posted
-- **Background task execution**: Workflows run via FastAPI `BackgroundTasks` in a new DB session to avoid transaction contention
+- **Durable execution**: workflow creation enqueues a `workflow_jobs` row; a worker claims it with a conditional update (`SKIP LOCKED` on PostgreSQL), retries with backoff and sweeps stale `running` jobs
 - **Review binding**: the pending run stores `review_state_hash`; a decision is rejected if the request, risk level or risk factors changed meanwhile
 - **Audit chain**: every governance event commits to the previous hash; `GET /audit/verify` detects edits and deletions
 - **Refresh rotation**: refresh tokens are registered by `jti`; replay of a revoked token revokes every session for the user
 - **Idempotency**: `Idempotency-Key` on workflow creation returns the original run instead of duplicating it
 - **MCP policy**: runtime MCP invocations are evaluated by OPA (`aiwf/mcp`) and fail closed
+- **Atomic budgets**: Redis Lua reserves tokens/cost before an LLM call; `commit_usage` reconciles the reservation to actual usage; production fails closed when the ledger is unavailable
+- **Durable queue**: workflow creation enqueues a `workflow_jobs` row; a worker claims it with a conditional update (`SKIP LOCKED` on PostgreSQL), retries with backoff and sweeps stale `running` jobs
 
 ## Agent Definitions
 

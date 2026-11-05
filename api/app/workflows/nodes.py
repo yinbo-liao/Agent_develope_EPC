@@ -233,15 +233,15 @@ async def evaluate_output_quality(run: WorkflowRun) -> dict[str, Any]:
 
 
 async def auto_generate_response(run: WorkflowRun) -> dict[str, Any]:
+    max_tokens = max(256, run.token_budget - run.total_tokens_used)
     model_choice = await model_router.select_model(
         user_id=run.user_id,
         task_complexity="fast",
-        estimated_tokens=max(256, run.token_budget - run.total_tokens_used),
+        estimated_tokens=max_tokens,
     )
-    allowed, budget_status = await cost_governor.check_budget(
-        run.user_id,
-        estimated_tokens=max(256, run.token_budget - run.total_tokens_used),
-        estimated_cost=float(model_choice["estimated_cost"]),
+    estimated_cost = float(model_choice["estimated_cost"])
+    allowed, budget_status = await cost_governor.reserve_budget(
+        run.user_id, estimated_tokens=max_tokens, estimated_cost=estimated_cost
     )
     if not allowed:
         return {
@@ -257,11 +257,14 @@ async def auto_generate_response(run: WorkflowRun) -> dict[str, Any]:
     cached_response = await check_cache(run.input_query, model_name, run.user_id, run.risk_level)
     if cached_response is not None:
         record_hit()
-        await cost_governor.record_usage(
+        cached_tokens = int(cached_response.get("tokens_used", 0))
+        await cost_governor.commit_usage(
             user_id=run.user_id,
             task_id=run.id,
-            tokens=cached_response.get("tokens_used", 0),
-            cost_usd=0.0,
+            reserved_tokens=max_tokens,
+            reserved_cost=estimated_cost,
+            actual_tokens=cached_tokens,
+            actual_cost=0.0,
             model=model_name,
         )
         return {
@@ -269,7 +272,7 @@ async def auto_generate_response(run: WorkflowRun) -> dict[str, Any]:
             "current_status": WorkflowStatus.COMPLETED.value,
             "final_response": cached_response.get("content", ""),
             "agent_finding": f"Cached response served (model={model_name}).",
-            "total_tokens_used": run.total_tokens_used + cached_response.get("tokens_used", 0),
+            "total_tokens_used": run.total_tokens_used + cached_tokens,
             "cost_usd": round(run.cost_usd, 6),
             "completed_at": datetime.now(timezone.utc),
             "updated_at": datetime.now(timezone.utc),
@@ -277,26 +280,47 @@ async def auto_generate_response(run: WorkflowRun) -> dict[str, Any]:
     record_miss()
 
     breaker = breaker_registry.get_llm_breaker(model_name)
-    async with breaker:
-        response = await LLMClient.generate(
-            prompt=run.input_query,
-            context=run.retrieval_results or [],
-            max_tokens=max(256, run.token_budget - run.total_tokens_used),
-            temperature=0.2,
+    try:
+        async with breaker:
+            response = await LLMClient.generate(
+                prompt=run.input_query,
+                context=run.retrieval_results or [],
+                max_tokens=max_tokens,
+                temperature=0.2,
+                model=model_name,
+            )
+    except Exception:
+        # Release the reservation: nothing was consumed.
+        await cost_governor.commit_usage(
+            user_id=run.user_id,
+            task_id=run.id,
+            reserved_tokens=max_tokens,
+            reserved_cost=estimated_cost,
+            actual_tokens=0,
+            actual_cost=0.0,
             model=model_name,
         )
+        raise
 
-    await cost_governor.record_usage(
+    await cost_governor.commit_usage(
         user_id=run.user_id,
         task_id=run.id,
-        tokens=response["tokens_used"],
-        cost_usd=response["cost_usd"],
-        model=response["model"],
+        reserved_tokens=max_tokens,
+        reserved_cost=estimated_cost,
+        actual_tokens=int(response["tokens_used"]),
+        actual_cost=float(response["cost_usd"]),
+        model=str(response["model"]),
     )
     track_llm_cost(str(response["model"]), float(response["cost_usd"]))
 
     # Store in semantic cache for future reuse
-    await store_cache(run.input_query, model_name, response, scope=run.user_id, risk_level=run.risk_level)
+    await store_cache(
+        run.input_query,
+        model_name,
+        response,
+        scope=run.user_id,
+        risk_level=run.risk_level,
+    )
 
     return {
         "current_step": "auto_generate_response",
@@ -311,24 +335,21 @@ async def auto_generate_response(run: WorkflowRun) -> dict[str, Any]:
 
 
 async def complex_analysis(run: WorkflowRun) -> dict[str, Any]:
+    max_tokens = max(512, run.token_budget - run.total_tokens_used)
     complexity = "complex" if run.risk_level == RiskLevel.HIGH.value else "medium"
     cascade = await model_router.select_cascade(
         user_id=run.user_id,
         task_complexity=complexity,
-        estimated_tokens=max(512, run.token_budget - run.total_tokens_used),
+        estimated_tokens=max_tokens,
     )
 
     cascade_models = cascade.get("models", [cascade["model"]])
     last_response: dict[str, Any] | None = None
 
     for attempt, model_name in enumerate(cascade_models[:3]):  # max 3 tiers
-        estimated_cost = model_router.estimate_cost(
-            model_name, max(512, run.token_budget - run.total_tokens_used)
-        )
-        allowed, budget_status = await cost_governor.check_budget(
-            run.user_id,
-            estimated_tokens=max(512, run.token_budget - run.total_tokens_used),
-            estimated_cost=estimated_cost,
+        estimated_cost = model_router.estimate_cost(model_name, max_tokens)
+        allowed, budget_status = await cost_governor.reserve_budget(
+            run.user_id, estimated_tokens=max_tokens, estimated_cost=estimated_cost
         )
         if not allowed:
             if last_response is not None:
@@ -346,21 +367,43 @@ async def complex_analysis(run: WorkflowRun) -> dict[str, Any]:
                 response = await LLMClient.generate(
                     prompt=f"Provide a more careful operational analysis for: {run.input_query}",
                     context=run.retrieval_results or [],
-                    max_tokens=max(512, run.token_budget - run.total_tokens_used),
+                    max_tokens=max_tokens,
                     temperature=0.1,
                     model=model_name,
                 )
         except RuntimeError:  # circuit breaker open
+            await cost_governor.commit_usage(
+                user_id=run.user_id,
+                task_id=run.id,
+                reserved_tokens=max_tokens,
+                reserved_cost=estimated_cost,
+                actual_tokens=0,
+                actual_cost=0.0,
+                model=model_name,
+            )
             continue
+        except Exception:
+            await cost_governor.commit_usage(
+                user_id=run.user_id,
+                task_id=run.id,
+                reserved_tokens=max_tokens,
+                reserved_cost=estimated_cost,
+                actual_tokens=0,
+                actual_cost=0.0,
+                model=model_name,
+            )
+            raise
 
         confidence = score_confidence(response["content"])
 
-        await cost_governor.record_usage(
+        await cost_governor.commit_usage(
             user_id=run.user_id,
             task_id=run.id,
-            tokens=response["tokens_used"],
-            cost_usd=response["cost_usd"],
-            model=response["model"],
+            reserved_tokens=max_tokens,
+            reserved_cost=estimated_cost,
+            actual_tokens=int(response["tokens_used"]),
+            actual_cost=float(response["cost_usd"]),
+            model=str(response["model"]),
         )
         track_llm_cost(str(response["model"]), float(response["cost_usd"]))
         last_response = response
@@ -373,7 +416,7 @@ async def complex_analysis(run: WorkflowRun) -> dict[str, Any]:
                 "final_response": response["content"],
                 "agent_finding": (
                     f"Cascade analysis tier {attempt + 1} "
-                    f"with {response['model']} (confidence={confidence:.2f})."
+                    f"(model={response['model']}, confidence={confidence:.2f})."
                 ),
                 "total_tokens_used": run.total_tokens_used + response["tokens_used"],
                 "cost_usd": round(run.cost_usd + response["cost_usd"], 6),
