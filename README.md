@@ -16,6 +16,7 @@ seeded on startup in development (`SEED_DEMO_USERS=true`):
 |---|---|---|---|
 | `demo` | `demo-pass-1234` | viewer | create and watch workflows |
 | `reviewer` | `reviewer-pass-1234` | reviewer | approve/reject CRITICAL runs |
+| `admin` | `admin-pass-1234` | admin | provision users, verify the audit chain |
 
 A reviewer cannot approve a run they requested, the run must still be in review, and the
 30-minute deadline is enforced. WebSocket/SSE connections use a two-minute, task-scoped
