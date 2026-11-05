@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-import { clearSession, loadSession, type Session } from "./lib/auth";
+import { loadSession, logout, type Session } from "./lib/auth";
 import { HomePage } from "./pages/HomePage";
 import { LoginPage } from "./pages/LoginPage";
 
@@ -21,7 +21,7 @@ export default function App() {
     <HomePage
       session={session}
       onLogout={() => {
-        clearSession();
+        void logout();
         setSession(null);
       }}
     />

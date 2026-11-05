@@ -65,6 +65,10 @@ services:
       REDIS_URL: redis://:${REDIS_PASSWORD:-changeme}@redis:6379/0
       OPA_URL: http://opa:8181
       SECRET_KEY: ${SECRET_KEY:-dev-secret-change-me}
+      SEED_DEMO_USERS: "true"
+      DEMO_USER_PASSWORD: ${DEMO_USER_PASSWORD:-demo-pass-1234}
+      DEMO_REVIEWER_PASSWORD: ${DEMO_REVIEWER_PASSWORD:-reviewer-pass-1234}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
       CORS_ORIGINS: '["http://localhost:5173","http://127.0.0.1:5173"]'
     depends_on:
       postgres:

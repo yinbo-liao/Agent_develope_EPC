@@ -85,6 +85,13 @@ class CostGovernor:
             logger.warning("Redis unavailable; cost governor using in-memory fallback")
         return self._redis_available
 
+    def set_tier(self, user_id: str, tier: str) -> None:
+        """Hydrate the in-process tier from the authenticated user record."""
+        try:
+            self._user_tiers[user_id] = BudgetTier(tier)
+        except ValueError:
+            self._user_tiers[user_id] = BudgetTier.STARTER
+
     def get_budget_config(self, user_id: str) -> BudgetConfig:
         tier = self._user_tiers.get(user_id, BudgetTier.STARTER)
         return BUDGET_CONFIGS[tier]

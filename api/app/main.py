@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 
-from app.api.v1 import analytics, auth, cost, events, health, human_review, mcp, workflows
+from app.api.v1 import analytics, audit, auth, cost, events, health, human_review, mcp, workflows
 from app.core.config import settings
 from app.core.database import close_db, init_db
 from app.core.logging import setup_logging
@@ -86,6 +86,7 @@ def create_application() -> FastAPI:
     app.include_router(cost.router, prefix=settings.API_PREFIX)
     app.include_router(mcp.router, prefix=settings.API_PREFIX)
     app.include_router(analytics.router, prefix=settings.API_PREFIX)
+    app.include_router(audit.router, prefix=settings.API_PREFIX)
     return app
 
 

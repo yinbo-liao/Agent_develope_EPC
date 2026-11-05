@@ -22,8 +22,11 @@ export function LoginPage({ onLogin }: { onLogin: (session: Session) => void }) 
       if (!response.ok) {
         throw new Error(response.status === 401 ? "Invalid username or password." : "Sign-in failed.");
       }
-      const payload = (await response.json()) as { access_token: string };
-      onLogin(saveSession(payload.access_token));
+      const payload = (await response.json()) as {
+        access_token: string;
+        refresh_token: string;
+      };
+      onLogin(saveSession(payload.access_token, payload.refresh_token));
     } catch (loginError) {
       setError(loginError instanceof Error ? loginError.message : "Sign-in failed.");
     } finally {

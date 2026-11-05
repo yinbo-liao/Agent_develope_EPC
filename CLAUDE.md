@@ -49,7 +49,7 @@ Dual transport: WebSocket (primary) with SSE fallback. `RedisWebSocketManager` (
 
 ### Database Models
 
-Three tables on `Base` (SQLAlchemy async):
+Core tables on `Base` (SQLAlchemy async):
 - `workflow_runs` — primary entity; tracks full workflow lifecycle, tokens, cost, risk, human review state
 - `human_review_decisions` — audit trail of reviewer decisions
 - `mcp_tool_call_audits` — MCP tool invocation audit log
@@ -170,6 +170,11 @@ pytest tests/security/test_firewall.py   # Run security firewall tests
 - **MCP tools are fallback stubs**: `ResilientMCPClient` returns placeholder results for all MCP servers unless explicitly enabled via settings
 - **Human review deadline**: 30-minute window; the workflow remains in REVIEWING status until a decision is posted
 - **Background task execution**: Workflows run via FastAPI `BackgroundTasks` in a new DB session to avoid transaction contention
+- **Review binding**: the pending run stores `review_state_hash`; a decision is rejected if the request, risk level or risk factors changed meanwhile
+- **Audit chain**: every governance event commits to the previous hash; `GET /audit/verify` detects edits and deletions
+- **Refresh rotation**: refresh tokens are registered by `jti`; replay of a revoked token revokes every session for the user
+- **Idempotency**: `Idempotency-Key` on workflow creation returns the original run instead of duplicating it
+- **MCP policy**: runtime MCP invocations are evaluated by OPA (`aiwf/mcp`) and fail closed
 
 ## Agent Definitions
 
@@ -184,8 +189,14 @@ The `.claude/agents/` directory defines five agent roles used by Claude Code's a
 | `POST` | `/api/v1/workflows` | Create and queue a workflow run |
 | `GET` | `/api/v1/workflows` | List the caller's workflow runs |
 | `GET` | `/api/v1/workflows/{task_id}` | Get workflow detail |
-| `POST` | `/api/v1/human-review/decide` | Approve/reject a paused workflow (reviewer role; no self-approval) |
+| `POST` | `/api/v1/human-review/decide` | Approve/reject a paused workflow (reviewer role; no self-approval; bound to review_state_hash) |
 | `GET` | `/api/v1/events/state/{task_id}` | Get current workflow state snapshot |
+| `POST` | `/api/v1/auth/refresh` | Rotate a refresh token (reuse revokes the family) |
+| `POST` | `/api/v1/auth/logout` | Revoke a refresh token |
+| `POST` | `/api/v1/auth/users` | Admin-only user provisioning |
+| `GET` | `/api/v1/auth/users` | Admin-only user list |
+| `GET` | `/api/v1/audit/events` | Admin-only recent audit events |
+| `GET` | `/api/v1/audit/verify` | Verify the audit hash chain |
 | `POST` | `/api/v1/events/ticket/{task_id}` | Issue a 2-minute, task-scoped stream ticket |
 | `GET` | `/api/v1/events/sse/{task_id}?ticket=` | SSE event stream for a workflow |
 | `WS` | `/api/v1/events/ws/{task_id}?ticket=` | WebSocket stream (`ping`, `status`; decisions are REST-only) |
@@ -206,6 +217,9 @@ All backend settings live in `api/app/core/config.py` using `pydantic-settings`.
 | `REDIS_URL` | redis://... | Redis for pub/sub |
 | `OPA_URL` | http://opa:8181 | OPA policy engine |
 | `ENVIRONMENT` | development | development/test/staging/production |
+| `JWT_ISSUER` | aiwf | Required JWT issuer |
+| `JWT_AUDIENCE` | aiwf-api | Required JWT audience |
+| `MCP_POLICY_ENFORCE` | true | Evaluate MCP calls against OPA `aiwf/mcp` |
 | `SEED_DEMO_USERS` | false | Seed the demo requester/reviewer (development only) |
 | `METRICS_TOKEN` | unset | Required header value for `/metrics` in production |
 | `REQUESTS_PER_MINUTE` | 120 | Rate limit threshold |

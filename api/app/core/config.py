@@ -34,6 +34,10 @@ class Settings(BaseSettings):
     ENABLE_TRACING: bool = True
     REQUESTS_PER_MINUTE: int = 120
 
+    JWT_ISSUER: str = "aiwf"
+    JWT_AUDIENCE: str = "aiwf-api"
+    MCP_POLICY_ENFORCE: bool = True
+
     METRICS_TOKEN: str | None = None
     SEED_DEMO_USERS: bool = False
     DEMO_USER_PASSWORD: str = "demo-pass-1234"
