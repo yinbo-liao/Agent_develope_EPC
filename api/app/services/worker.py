@@ -10,7 +10,11 @@ import time
 from collections.abc import Awaitable, Callable
 
 from app.core.config import settings
+from sqlalchemy import func, select
+
 from app.core import database
+from app.core.metrics import set_job_queue_depth
+from app.models.job import WorkflowJob
 from app.services.job_queue import claim_job, complete_job, sweep_orphans
 from app.workflows.runner import run_workflow_in_new_session
 
@@ -33,7 +37,20 @@ class WorkflowWorker:
         self._stop = asyncio.Event()
         self._last_sweep = 0.0
 
+    async def _update_depth(self) -> None:
+        try:
+            async with database.SessionLocal() as session:
+                depth = await session.scalar(
+                    select(func.count())
+                    .select_from(WorkflowJob)
+                    .where(WorkflowJob.status == "queued")
+                )
+                set_job_queue_depth(int(depth or 0))
+        except Exception:
+            logger.debug("Could not update queue depth", exc_info=True)
+
     async def run_once(self) -> bool:
+        await self._update_depth()
         async with database.SessionLocal() as session:
             job = await claim_job(session, self.worker_id)
         if job is None:

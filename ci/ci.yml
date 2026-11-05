@@ -81,8 +81,20 @@ jobs:
           path: frontend/evidence/frontend.json
           if-no-files-found: error
 
+
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.16.4
+      - name: Lint chart
+        run: helm lint helm/aiwf
+      - name: Render chart
+        run: helm template aiwf helm/aiwf --namespace aiwf > /tmp/aiwf-rendered.yaml
   gate:
-    needs: [backend, frontend]
+    needs: [backend, frontend, helm]
     if: always()
     runs-on: ubuntu-latest
     steps:

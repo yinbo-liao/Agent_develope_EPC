@@ -81,13 +81,28 @@ The workflow is staged at `ci/ci.yml` because the current token lacks the `workf
 scope; `docs/CI.md` has the one-command enablement. Backend coverage is 56% with a
 55% gate; the P3 target is 70%.
 
+## Deployment
+
+```bash
+helm lint helm/aiwf -f helm/aiwf/values-production.yaml
+helm upgrade --install aiwf helm/aiwf -f helm/aiwf/values-production.yaml --namespace aiwf
+```
+
+The chart deploys both services, ingress, autoscaling/PDB, optional network policy and a
+real `alembic upgrade head` migration hook. It expects an external PostgreSQL/Redis and
+an `aiwf-secrets` secret; see `docs/DEPLOYMENT.md`.
+
+Local compose also runs Prometheus (:9090), Alertmanager (:9093) and Grafana (:3000,
+admin/admin by default). Metrics include HTTP latency/status, `workflow_jobs_total` and
+`workflow_job_queue_depth`; see `infrastructure/prometheus/alerts.yml`.
+
 ## Known limitations (next phases)
 
 - The LLM remains simulated; retrieval is keyword matching and MCP tools are stubs.
 - Rate limiting remains in-process (P2 moves it to Redis).
-- Remaining delivery work: end-to-end tests, complete Helm chart, real model adapter and the KPI/GATE_G contract.
+- Remaining delivery work: Playwright E2E, coverage to 70%, real model adapter and the KPI/GATE_G contract.
 - CI is a template at `ci/ci.yml` until a token with the `workflow` scope enables it.
-- Helm chart is incomplete (no Service/frontend/Ingress; migrations are a no-op job).
+- End-to-end (Playwright) tests are still missing; coverage is 57% (target 70%).
 - Backend and frontend unit tests exist; end-to-end (Playwright) coverage is still P3.
 
 See `docs/` in the planning repository for the phase plan (P1–P4).

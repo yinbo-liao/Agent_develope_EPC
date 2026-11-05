@@ -13,13 +13,14 @@ git commit -m "ci: enable evidence pipeline"
 git push
 ```
 
-The pipeline runs two evidence jobs and a gate:
+The pipeline runs two evidence jobs, a Helm validation job and a gate:
 
 1. **backend** — ruff, pytest with coverage, bandit and pip-audit; writes
    `api/evidence/backend.json`.
 2. **frontend** — production build, Vitest, npm audit; writes
    `frontend/evidence/frontend.json`.
-3. **gate** — downloads both records and runs
+3. **helm** — `helm lint` and `helm template` for the chart.
+4. **gate** — downloads both records and runs
    `python api/scripts/evidence.py verify ... --commit $GITHUB_SHA`. Required
    checks must have passed, the commit must match, the record must be under 24h old,
    and backend coverage must be at least 55%.

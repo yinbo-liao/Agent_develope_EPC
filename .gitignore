@@ -38,3 +38,4 @@ htmlcov/
 *.tsbuildinfo
 pytest-of-*/
 evidence/
+.tools/

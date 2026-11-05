@@ -15,6 +15,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.metrics import track_job_status
 from app.models.job import WorkflowJob
 
 logger = logging.getLogger(__name__)
@@ -43,6 +44,7 @@ async def enqueue_job(
         available_at=_now() + timedelta(seconds=delay_seconds),
     )
     session.add(job)
+    track_job_status("queued")
     return job
 
 
@@ -78,6 +80,7 @@ async def claim_job(session: AsyncSession, worker_id: str) -> WorkflowJob | None
         return None
     await session.commit()
     await session.refresh(candidate)
+    track_job_status("running")
     return candidate
 
 
@@ -92,16 +95,19 @@ async def complete_job(
         return
     if error is None:
         job.status = "succeeded"
+        track_job_status("succeeded")
         job.last_error = None
         job.locked_at = None
         job.locked_by = None
     elif job.attempts >= job.max_attempts:
         job.status = "failed"
+        track_job_status("failed")
         job.last_error = error[:2000]
         job.locked_at = None
         job.locked_by = None
     else:
         job.status = "queued"
+        track_job_status("queued")
         job.last_error = error[:2000]
         job.locked_at = None
         job.locked_by = None
@@ -136,9 +142,11 @@ async def sweep_orphans(
         job.updated_at = now
         if job.attempts >= job.max_attempts:
             job.status = "failed"
+            track_job_status("failed")
             job.last_error = "Worker disappeared; attempts exhausted"
         else:
             job.status = "queued"
+            track_job_status("queued")
             job.available_at = now
         recovered += 1
     await session.commit()

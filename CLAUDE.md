@@ -165,9 +165,20 @@ docker build -f infrastructure/docker/frontend/Dockerfile.prod -t aiwf-frontend 
 ### Kubernetes (Helm)
 
 ```bash
-helm install aiwf ./helm/aiwf -f helm/aiwf/values-production.yaml
-helm upgrade aiwf ./helm/aiwf -f helm/aiwf/values-production.yaml
+helm lint helm/aiwf -f helm/aiwf/values-production.yaml
+helm template aiwf helm/aiwf -f helm/aiwf/values-production.yaml --namespace aiwf >/tmp/rendered.yaml
+helm upgrade --install aiwf helm/aiwf -f helm/aiwf/values-production.yaml --namespace aiwf
 ```
+
+The pre-install/pre-upgrade Job runs `alembic upgrade head`. Create the `aiwf-secrets`
+secret first (SECRET_KEY, DATABASE_URL, REDIS_URL, optional METRICS_TOKEN); see
+`docs/DEPLOYMENT.md`.
+
+### Monitoring (local compose)
+
+Prometheus `:9090`, Alertmanager `:9093`, Grafana `:3000` (admin/admin default).
+Scrape config and SLO alerts live in `infrastructure/prometheus/`; dashboards in
+`infrastructure/grafana/`. Job metrics: `workflow_jobs_total`, `workflow_job_queue_depth`.
 
 ### Pre-commit & Security
 
@@ -193,6 +204,7 @@ pytest tests/security/test_firewall.py   # Run security firewall tests
 - **Idempotency**: `Idempotency-Key` on workflow creation returns the original run instead of duplicating it
 - **MCP policy**: runtime MCP invocations are evaluated by OPA (`aiwf/mcp`) and fail closed
 - **Atomic budgets**: Redis Lua reserves tokens/cost before an LLM call; `commit_usage` reconciles the reservation to actual usage; production fails closed when the ledger is unavailable
+- **Helm/ops**: chart renders Service/Ingress/HPA/PDB/NetworkPolicy and a real alembic migration hook; Prometheus scrapes `/metrics`, alerts on 5xx/p95/queue depth/job failures/cost
 
 ## Agent Definitions
 
