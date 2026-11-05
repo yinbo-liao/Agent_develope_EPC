@@ -36,6 +36,7 @@ jobs:
             --min-coverage 70 \
             --check "ruff=ruff check ." \
             --check "tests=pytest -q --cov=app --cov-report=xml --cov-fail-under=70" \
+            --check "eval=python scripts/run_eval.py" \
             --advisory "bandit=bandit -r app -q -ll" \
             --advisory "pip-audit=pip-audit"
       - name: Upload backend evidence

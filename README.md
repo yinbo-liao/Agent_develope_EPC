@@ -96,11 +96,30 @@ Local compose also runs Prometheus (:9090), Alertmanager (:9093) and Grafana (:3
 admin/admin by default). Metrics include HTTP latency/status, `workflow_jobs_total` and
 `workflow_job_queue_depth`; see `infrastructure/prometheus/alerts.yml`.
 
+## Model provider, KPI and evaluation
+
+The LLM client supports `simulated` (default), `openai` (any OpenAI-compatible
+`/chat/completions`) and `anthropic` (Messages API). Configure `LLM_PROVIDER`,
+`LLM_BASE_URL`, `LLM_API_KEY` and `LLM_MODEL`; production refuses a real provider
+without a key. The default remains simulated so the demo needs no external account.
+
+The product outcome is **`governed_completion_rate` ≥ 80%** with guardrails: zero
+unsafe approvals (self-approval or after deadline), p95 run duration ≤ 120 s, and
+cost ≤ $1.00 per completed run. `GET /api/v1/kpi/summary` reports it; admin-only
+`GET /api/v1/kpi/gate-g` returns the expansion decision. GATE_G holds autonomy
+expansion only — it never blocks a release. See `docs/KPI-CONTRACT.md`.
+
+The red-team corpus (`api/eval/red_team.jsonl`) runs in CI:
+
+```bash
+cd api && python scripts/run_eval.py
+```
+
 ## Known limitations (next phases)
 
-- The LLM remains simulated; retrieval is keyword matching and MCP tools are stubs.
+- The default provider is simulated; the OpenAI/Anthropic adapters require credentials. Retrieval is still keyword matching and MCP tools are stubs.
 - Rate limiting remains in-process (P2 moves it to Redis).
-- Remaining delivery work: real model adapter, the KPI/GATE_G contract, and staging validation of the chart/migration hook.
+- Remaining delivery work: real embeddings retrieval, an end-to-end model-quality evaluation, and staging validation of the chart/migration hook.
 - CI is a template at `ci/ci.yml` until a token with the `workflow` scope enables it.
 - End-to-end (Playwright) tests live in `frontend/e2e`; they need the compose stack and a browser.
 - Backend and frontend unit tests exist; end-to-end (Playwright) coverage is still P3.

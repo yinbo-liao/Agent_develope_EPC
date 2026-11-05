@@ -34,6 +34,12 @@ class Settings(BaseSettings):
     ENABLE_TRACING: bool = True
     REQUESTS_PER_MINUTE: int = 120
 
+    LLM_PROVIDER: str = "simulated"
+    LLM_BASE_URL: str = "https://api.openai.com/v1"
+    LLM_API_KEY: str | None = None
+    LLM_MODEL: str | None = None
+    LLM_TIMEOUT_SECONDS: float = 30.0
+
     JWT_ISSUER: str = "aiwf"
     JWT_AUDIENCE: str = "aiwf-api"
     MCP_POLICY_ENFORCE: bool = True
@@ -99,6 +105,12 @@ class Settings(BaseSettings):
             errors.append("SECRET_KEY must be at least 32 characters in production.")
         if self.SEED_DEMO_USERS:
             errors.append("SEED_DEMO_USERS must be false in production.")
+        if self.LLM_PROVIDER not in {"simulated", "openai", "anthropic"}:
+            errors.append("LLM_PROVIDER must be simulated, openai or anthropic.")
+        if self.LLM_PROVIDER != "simulated" and not self.LLM_API_KEY:
+            errors.append("LLM_API_KEY is required when LLM_PROVIDER is not simulated.")
+        if self.LLM_PROVIDER != "simulated" and not self.LLM_BASE_URL:
+            errors.append("LLM_BASE_URL is required when LLM_PROVIDER is not simulated.")
         return errors
 
 

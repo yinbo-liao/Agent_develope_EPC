@@ -187,6 +187,7 @@ Scrape config and SLO alerts live in `infrastructure/prometheus/`; dashboards in
 pre-commit run --all-files        # Run all hooks (trailing whitespace, YAML check, secret detection, firewall tests, scope validation)
 python scripts/validate_agent_scopes.py  # Validate .claude/agents/*.md have required headings
 pytest tests/security/test_firewall.py   # Run security firewall tests
+python scripts/run_eval.py               # Red-team classification baseline
 ```
 
 ## Key Design Decisions
@@ -194,7 +195,7 @@ pytest tests/security/test_firewall.py   # Run security firewall tests
 - **Fail-closed OPA**: If the OPA policy engine is unreachable, access is denied (not granted)
 - **Graceful Redis degradation**: WebSocket manager falls back to local-only fanout when Redis is unavailable
 - **Circuit breaker on LLM calls**: 3 consecutive failures open the circuit for 30s before retrying
-- **LLM client is simulated**: `LLMClient.generate()` produces placeholder responses with token/cost estimation — real provider integration is a future wave
+- **Model provider**: `LLMClient` supports simulated (default), OpenAI-compatible and Anthropic providers; production requires an API key when a real provider is selected
 - **Vector store is keyword-based**: `retrieve_context()` in `vector_store.py` extracts topic keywords rather than performing real embeddings search
 - **MCP tools are fallback stubs**: `ResilientMCPClient` returns placeholder results for all MCP servers unless explicitly enabled via settings
 - **Human review deadline**: 30-minute window; the workflow remains in REVIEWING status until a decision is posted
@@ -206,6 +207,8 @@ pytest tests/security/test_firewall.py   # Run security firewall tests
 - **MCP policy**: runtime MCP invocations are evaluated by OPA (`aiwf/mcp`) and fail closed
 - **Atomic budgets**: Redis Lua reserves tokens/cost before an LLM call; `commit_usage` reconciles the reservation to actual usage; production fails closed when the ledger is unavailable
 - **Helm/ops**: chart renders Service/Ingress/HPA/PDB/NetworkPolicy and a real alembic migration hook; Prometheus scrapes `/metrics`, alerts on 5xx/p95/queue depth/job failures/cost
+- **Outcome**: `governed_completion_rate` ≥ 80% with zero unsafe approvals, p95 ≤ 120 s and ≤ $1.00/completed run; GATE_G holds expansion only, never releases
+- **Red-team**: deterministic classification corpus in `api/eval/red_team.jsonl`, required in CI
 
 ## Agent Definitions
 
@@ -228,6 +231,8 @@ The `.claude/agents/` directory defines five agent roles used by Claude Code's a
 | `GET` | `/api/v1/auth/users` | Admin-only user list |
 | `GET` | `/api/v1/audit/events` | Admin-only recent audit events |
 | `GET` | `/api/v1/audit/verify` | Verify the audit hash chain |
+| `GET` | `/api/v1/kpi/summary` | Governed completion KPI and guardrails |
+| `GET` | `/api/v1/kpi/gate-g` | Admin GATE_G expansion decision |
 | `POST` | `/api/v1/events/ticket/{task_id}` | Issue a 2-minute, task-scoped stream ticket |
 | `GET` | `/api/v1/events/sse/{task_id}?ticket=` | SSE event stream for a workflow |
 | `WS` | `/api/v1/events/ws/{task_id}?ticket=` | WebSocket stream (`ping`, `status`; decisions are REST-only) |
@@ -251,6 +256,10 @@ All backend settings live in `api/app/core/config.py` using `pydantic-settings`.
 | `JWT_ISSUER` | aiwf | Required JWT issuer |
 | `JWT_AUDIENCE` | aiwf-api | Required JWT audience |
 | `MCP_POLICY_ENFORCE` | true | Evaluate MCP calls against OPA `aiwf/mcp` |
+| `LLM_PROVIDER` | simulated | simulated, openai or anthropic |
+| `LLM_BASE_URL` | OpenAI API | Provider base URL |
+| `LLM_API_KEY` | unset | Required for real providers |
+| `LLM_MODEL` | unset | Optional provider model override |
 | `WORKER_ENABLED` | true | Run the built-in workflow job worker |
 | `WORKER_POLL_SECONDS` | 2.0 | Queue poll interval |
 | `JOB_MAX_ATTEMPTS` | 3 | Delivery attempts before a job is failed |

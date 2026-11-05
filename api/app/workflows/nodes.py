@@ -55,11 +55,18 @@ async def assess_risk(run: WorkflowRun) -> dict[str, Any]:
         r"\b(payment|credit.?card|ssn|social.security)\b": "Sensitive financial or personal data",
         r"\b(drop|truncate|destroy)\b": "Destructive operation requested",
         r"\b(sudo|root|superuser)\b": "Privilege escalation language",
+        r"\b(ignore|disregard)\b.*\b(instructions|prompt)\b": "Prompt injection attempt",
+        r"\b(system prompt|exfiltrate|prompt injection)\b": "Prompt or data exfiltration attempt",
+        r"\b(bypass|skip)\b.*\b(approval|review)\b": "Approval bypass attempt",
     }
     high_patterns = {
         r"\b(delete|remove)\b": "Deletion request",
         r"\b(update|modify|alter)\b": "Modification request",
         r"\b(secret|token|password|key)\b": "Credential-related access",
+        r"\b(export|extract)\b": "Bulk data export request",
+        r"\b(dump)\b": "Bulk data dump request",
+        r"\b(database|production|prod)\b": "Production data system",
+        r"\b(billing|customer|records)\b": "Sensitive business data",
     }
 
     for pattern, reason in critical_patterns.items():

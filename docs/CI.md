@@ -15,7 +15,7 @@ git push
 
 The pipeline runs two evidence jobs, Helm and end-to-end jobs, and a gate:
 
-1. **backend** — ruff, pytest with coverage, bandit and pip-audit; writes
+1. **backend** — ruff, pytest with coverage, red-team eval, bandit and pip-audit; writes
    `api/evidence/backend.json`.
 2. **frontend** — production build, Vitest, npm audit; writes
    `frontend/evidence/frontend.json`.
