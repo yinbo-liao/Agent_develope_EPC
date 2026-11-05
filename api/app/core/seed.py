@@ -3,8 +3,8 @@
 The platform ships with no registration route by design. For a local demo we seed
 a requester and a reviewer so the human-review gate can be demonstrated without
 weakening authentication. Seeding is disabled in production by config validation.
-"""
-
+a requester, a reviewer and an admin so the governance gates can be demonstrated
+without weakening authentication. Seeding is disabled in production by config validation.
 from __future__ import annotations
 
 import logging
@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 DEMO_USERS = (
     ("demo", "DEMO_USER_PASSWORD", "viewer", "starter"),
     ("reviewer", "DEMO_REVIEWER_PASSWORD", "reviewer", "starter"),
+    ("admin", "DEMO_ADMIN_PASSWORD", "admin", "enterprise"),
 )
 
 
