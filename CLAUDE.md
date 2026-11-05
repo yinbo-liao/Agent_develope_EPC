@@ -94,7 +94,7 @@ api/.env.example              Environment variable template for local developmen
 
 Every workflow, event and review endpoint requires a JWT. Development seeds two users
 (`SEED_DEMO_USERS=true`): `demo` / `demo-pass-1234` (viewer) and `reviewer` /
-`reviewer-pass-1234` (reviewer). The frontend signs in via `POST /api/v1/auth/token` and
+`reviewer-pass-1234` (reviewer) and `admin` / `admin-pass-1234` (admin; provisioning and audit verification). The frontend signs in via `POST /api/v1/auth/token` and
 sends `Authorization: Bearer`; WebSocket/SSE use a task-scoped ticket from
 `POST /api/v1/events/ticket/{task_id}`.
 ## Commands

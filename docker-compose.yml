@@ -68,6 +68,7 @@ services:
       SEED_DEMO_USERS: "true"
       DEMO_USER_PASSWORD: ${DEMO_USER_PASSWORD:-demo-pass-1234}
       DEMO_REVIEWER_PASSWORD: ${DEMO_REVIEWER_PASSWORD:-reviewer-pass-1234}
+      DEMO_ADMIN_PASSWORD: ${DEMO_ADMIN_PASSWORD:-admin-pass-1234}
       METRICS_TOKEN: ${METRICS_TOKEN:-}
       CORS_ORIGINS: '["http://localhost:5173","http://127.0.0.1:5173"]'
     depends_on:

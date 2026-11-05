@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     SEED_DEMO_USERS: bool = False
     DEMO_USER_PASSWORD: str = "demo-pass-1234"
     DEMO_REVIEWER_PASSWORD: str = "reviewer-pass-1234"
+    DEMO_ADMIN_PASSWORD: str = "admin-pass-1234"
 
     MCP_POSTGRES_ENABLED: bool = True
     MCP_GITHUB_ENABLED: bool = False
