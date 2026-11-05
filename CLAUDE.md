@@ -53,6 +53,10 @@ Core tables on `Base` (SQLAlchemy async):
 - `workflow_runs` — primary entity; tracks full workflow lifecycle, tokens, cost, risk, human review state
 - `human_review_decisions` — audit trail of reviewer decisions
 - `mcp_tool_call_audits` — MCP tool invocation audit log
+- `audit_events` — append-only, hash-chained governance log
+- `refresh_tokens` — refresh-token registry for rotation and revocation
+- `idempotency_keys` — per-user replay protection for workflow creation
+- `workflow_jobs` — durable execution queue with attempts, locks and visibility timeout
 
 ## Repository Layout
 
@@ -169,12 +173,13 @@ pytest tests/security/test_firewall.py   # Run security firewall tests
 - **Vector store is keyword-based**: `retrieve_context()` in `vector_store.py` extracts topic keywords rather than performing real embeddings search
 - **MCP tools are fallback stubs**: `ResilientMCPClient` returns placeholder results for all MCP servers unless explicitly enabled via settings
 - **Human review deadline**: 30-minute window; the workflow remains in REVIEWING status until a decision is posted
-- **Background task execution**: Workflows run via FastAPI `BackgroundTasks` in a new DB session to avoid transaction contention
+- **Durable execution**: workflow creation enqueues a `workflow_jobs` row; a worker claims it with a conditional update (`SKIP LOCKED` on PostgreSQL), retries with backoff and sweeps stale `running` jobs
 - **Review binding**: the pending run stores `review_state_hash`; a decision is rejected if the request, risk level or risk factors changed meanwhile
 - **Audit chain**: every governance event commits to the previous hash; `GET /audit/verify` detects edits and deletions
 - **Refresh rotation**: refresh tokens are registered by `jti`; replay of a revoked token revokes every session for the user
 - **Idempotency**: `Idempotency-Key` on workflow creation returns the original run instead of duplicating it
 - **MCP policy**: runtime MCP invocations are evaluated by OPA (`aiwf/mcp`) and fail closed
+- **Atomic budgets**: Redis Lua reserves tokens/cost before an LLM call; `commit_usage` reconciles the reservation to actual usage; production fails closed when the ledger is unavailable
 
 ## Agent Definitions
 
@@ -220,6 +225,10 @@ All backend settings live in `api/app/core/config.py` using `pydantic-settings`.
 | `JWT_ISSUER` | aiwf | Required JWT issuer |
 | `JWT_AUDIENCE` | aiwf-api | Required JWT audience |
 | `MCP_POLICY_ENFORCE` | true | Evaluate MCP calls against OPA `aiwf/mcp` |
+| `WORKER_ENABLED` | true | Run the built-in workflow job worker |
+| `WORKER_POLL_SECONDS` | 2.0 | Queue poll interval |
+| `JOB_MAX_ATTEMPTS` | 3 | Delivery attempts before a job is failed |
+| `JOB_VISIBILITY_TIMEOUT_SECONDS` | 300 | Age after which a `running` job is an orphan |
 | `SEED_DEMO_USERS` | false | Seed the demo requester/reviewer (development only) |
 | `METRICS_TOKEN` | unset | Required header value for `/metrics` in production |
 | `REQUESTS_PER_MINUTE` | 120 | Rate limit threshold |

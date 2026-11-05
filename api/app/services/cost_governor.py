@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -60,6 +61,27 @@ BUDGET_CONFIGS = {
 }
 
 
+RESERVE_SCRIPT = """
+local tokens = tonumber(redis.call('GET', KEYS[1]) or '0')
+local cost = tonumber(redis.call('GET', KEYS[2]) or '0')
+local est_tokens = tonumber(ARGV[1])
+local est_cost = tonumber(ARGV[2])
+local max_tokens = tonumber(ARGV[3])
+local max_cost = tonumber(ARGV[4])
+if tokens + est_tokens > max_tokens then
+  return {0, tokens, cost, 'Daily token limit exceeded'}
+end
+if cost + est_cost > max_cost then
+  return {0, tokens, cost, 'Daily cost limit exceeded'}
+end
+redis.call('INCRBY', KEYS[1], est_tokens)
+redis.call('INCRBYFLOAT', KEYS[2], est_cost)
+redis.call('EXPIRE', KEYS[1], 172800)
+redis.call('EXPIRE', KEYS[2], 172800)
+return {1, tokens + est_tokens, cost + est_cost, ''}
+"""
+
+
 class CostGovernor:
     """Cost governance with Redis persistence and in-memory fallback."""
 
@@ -70,6 +92,7 @@ class CostGovernor:
         # In-memory fallback
         self._user_tiers: dict[str, BudgetTier] = {}
         self._usage: dict[tuple[str, str], dict[str, object]] = {}
+        self._lock = asyncio.Lock()
 
     async def _ensure_redis(self) -> bool:
         """Lazy-init Redis connection. Returns True if Redis is available."""
@@ -273,6 +296,134 @@ class CostGovernor:
             "budget_tier": config.tier.value,
             "window_start": (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat(),
         }
+
+    async def reserve_budget(
+        self,
+        user_id: str,
+        estimated_tokens: int,
+        estimated_cost: float,
+    ) -> tuple[bool, dict[str, object]]:
+        """Atomically reserve budget before an LLM call.
+
+        Redis executes the check-and-increment as one Lua script, so concurrent
+        attempts cannot both pass a limit check. Without Redis, an asyncio lock
+        provides the same guarantee within this process (production fails closed).
+        """
+        config = self.get_budget_config(user_id)
+        if await self._ensure_redis():
+            today = self._today()
+            token_key = f"usage:{user_id}:{today}:tokens"
+            cost_key = f"usage:{user_id}:{today}:cost"
+            try:
+                outcome = await self._redis.eval(  # type: ignore[union-attr]
+                    RESERVE_SCRIPT,
+                    2,
+                    token_key,
+                    cost_key,
+                    estimated_tokens,
+                    estimated_cost,
+                    config.daily_token_limit,
+                    config.daily_cost_limit_usd,
+                )
+                allowed = bool(int(outcome[0]))
+                current_tokens = int(float(outcome[1]))
+                current_cost = float(outcome[2])
+                reason = str(outcome[3] or "")
+                details = {
+                    "tier": config.tier.value,
+                    "daily_token_limit": config.daily_token_limit,
+                    "daily_cost_limit_usd": config.daily_cost_limit_usd,
+                    "current_tokens": current_tokens,
+                    "current_cost_usd": round(current_cost, 6),
+                    "reserved_tokens": estimated_tokens,
+                    "reserved_cost_usd": round(estimated_cost, 6),
+                }
+                if not allowed:
+                    details["reason"] = reason or "Budget limit exceeded"
+                return allowed, details
+            except Exception as exc:
+                logger.error("Atomic budget reservation failed: %s", exc)
+                if settings.is_production:
+                    return False, {
+                        "tier": config.tier.value,
+                        "reason": "Budget ledger error; failing closed",
+                    }
+
+        if settings.is_production:
+            return False, {
+                "tier": config.tier.value,
+                "reason": "Budget ledger unavailable; failing closed",
+            }
+
+        async with self._lock:
+            usage = self._current_usage(user_id)
+            current_tokens = int(usage["tokens"])
+            current_cost = float(usage["cost"])
+            if current_tokens + estimated_tokens > config.daily_token_limit:
+                return False, {
+                    "tier": config.tier.value,
+                    "reason": "Daily token limit exceeded",
+                    "current_tokens": current_tokens,
+                }
+            if current_cost + estimated_cost > config.daily_cost_limit_usd:
+                return False, {
+                    "tier": config.tier.value,
+                    "reason": "Daily cost limit exceeded",
+                    "current_cost_usd": round(current_cost, 6),
+                }
+            usage["tokens"] = current_tokens + estimated_tokens
+            usage["cost"] = round(current_cost + estimated_cost, 6)
+            usage["updated_at"] = datetime.now(timezone.utc)
+            return True, {
+                "tier": config.tier.value,
+                "current_tokens": usage["tokens"],
+                "current_cost_usd": usage["cost"],
+                "reserved_tokens": estimated_tokens,
+                "reserved_cost_usd": round(estimated_cost, 6),
+            }
+
+    async def commit_usage(
+        self,
+        user_id: str,
+        task_id: str,
+        *,
+        reserved_tokens: int,
+        reserved_cost: float,
+        actual_tokens: int,
+        actual_cost: float,
+        model: str,
+    ) -> None:
+        """Replace a reservation with the actual usage (zero on failure)."""
+        delta_tokens = actual_tokens - reserved_tokens
+        delta_cost = actual_cost - reserved_cost
+        if await self._ensure_redis():
+            today = self._today()
+            token_key = f"usage:{user_id}:{today}:tokens"
+            cost_key = f"usage:{user_id}:{today}:cost"
+            model_key = f"usage:{user_id}:{today}:models"
+            pipe = self._redis.pipeline()  # type: ignore[union-attr]
+            if delta_tokens:
+                pipe.incrby(token_key, delta_tokens)
+            if delta_cost:
+                pipe.incrbyfloat(cost_key, delta_cost)
+            if actual_tokens:
+                pipe.hincrby(model_key, model, actual_tokens)
+            pipe.expire(token_key, 172800)
+            pipe.expire(cost_key, 172800)
+            pipe.expire(model_key, 172800)
+            await pipe.execute()
+            await self._check_alerts(user_id)
+            return
+
+        async with self._lock:
+            usage = self._current_usage(user_id)
+            usage["tokens"] = max(0, int(usage["tokens"]) + delta_tokens)
+            usage["cost"] = max(0.0, round(float(usage["cost"]) + delta_cost, 6))
+            models = usage["models"]
+            assert isinstance(models, dict)
+            if actual_tokens:
+                models[model] = int(models.get(model, 0)) + actual_tokens
+            usage["updated_at"] = datetime.now(timezone.utc)
 
     async def close(self) -> None:
         if self._redis:
