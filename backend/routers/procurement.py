@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from datetime import date
 from typing import Optional
 from database import get_db
@@ -26,11 +26,13 @@ class POItem(BaseModel):
 
 
 class POCreate(BaseModel):
-    po_number: str
-    vendor_name: str
+    po_number: str = Field(..., min_length=1, max_length=100)
+    vendor_name: str = Field(..., min_length=1, max_length=200)
     order_date: Optional[date] = None
     expected_delivery_date: Optional[date] = None
-    items: list[POItem]
+    # Bound the write payload: one PO with thousands of line items is a DoS
+    # vector and is never a legitimate request.
+    items: list[POItem] = Field(..., min_length=1, max_length=500)
 
 
 class MaterialReceipt(BaseModel):

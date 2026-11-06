@@ -180,6 +180,23 @@ class LLMProvider:
 
         raise RuntimeError("No embedding provider available. Set FPSO_DEEPSEEK_API_KEY or FPSO_ANTHROPIC_API_KEY.")
 
+    async def close(self) -> None:
+        """Close any provider HTTP clients that were actually constructed.
+
+        Providers are lazy, so an unconfigured provider is simply skipped.
+        Never raises: shutdown must not fail because one provider is unhealthy.
+        """
+        for provider in (self._deepseek, self._anthropic):
+            if provider is None:
+                continue
+            closer = getattr(provider, "close", None)
+            if closer is None:
+                continue
+            try:
+                await closer()
+            except Exception as exc:  # pragma: no cover - best effort
+                logger.warning("Error closing LLM provider client: %s", exc)
+
 
 # Singleton
 llm_provider = LLMProvider()

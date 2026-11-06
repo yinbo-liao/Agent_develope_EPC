@@ -9,7 +9,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, Request, WebSocket, WebSocketDisconnect, status
+from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.datastructures import Headers, MutableHeaders
@@ -173,6 +173,11 @@ def create_app() -> FastAPI:
         try:
             yield
         finally:
+            try:
+                from services.llm_provider import llm_provider
+                await llm_provider.close()
+            except Exception as exc:  # pragma: no cover - shutdown best effort
+                logger.warning("Error closing LLM provider clients: %s", exc)
             try:
                 await manager.stop_redis_listener()
             except Exception as exc:  # pragma: no cover - shutdown best effort
@@ -393,15 +398,26 @@ def create_app() -> FastAPI:
     async def get_alerts(
         project_id: str,
         severity: str | None = None,
+        page: int = 1,
+        page_size: int = 100,
         user: TokenData = Depends(get_current_user),
     ):
         db_pool = await get_pool()
+        if not await user_has_project_access(db_pool, project_id, user):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="You do not have access to this project.",
+            )
+        page = max(1, page)
+        page_size = max(1, min(page_size, 500))
         query = "SELECT * FROM schedule_alerts WHERE project_id = $1 AND is_resolved = FALSE"
         params = [project_id]
         if severity:
             query += " AND severity = $2"
             params.append(severity)
-        query += " ORDER BY CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 ELSE 2 END"
+        query += (" ORDER BY CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 ELSE 2 END"
+                  " LIMIT $%d OFFSET $%d" % (len(params) + 1, len(params) + 2))
+        params.extend([page_size, (page - 1) * page_size])
         async with db_pool.acquire() as conn:
             rows = await conn.fetch(query, *params)
         return [dict(r) for r in rows]
