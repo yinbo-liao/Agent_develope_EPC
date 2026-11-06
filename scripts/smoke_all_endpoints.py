@@ -727,6 +727,43 @@ class Sweep:
         self.assert_result("ai chat returns a response", chat,
                            lambda d: isinstance(d, dict) and d.get("response"),
                            "empty response")
+
+        analyses = {
+            "schedule risk": ("schedule_risk", {"analysis_type": "schedule_risk"},
+                              lambda d: isinstance(d, dict) and "risk_level" in d,
+                              "missing risk_level"),
+            "conflict detection": ("conflict_detection",
+                                   {"analysis_type": "conflict_detection"},
+                                   lambda d: isinstance(d, dict)
+                                   and "conflicts_found" in d,
+                                   "missing conflicts_found"),
+            "gate assessment": ("gate_assessment",
+                                {"analysis_type": "gate_assessment",
+                                 "gate_id": "SG-1"},
+                                lambda d: isinstance(d, dict)
+                                and ("ai_readiness_score" in d or "error" in d),
+                                "missing ai_readiness_score"),
+            "weekly report": ("weekly_report",
+                              {"analysis_type": "weekly_report",
+                               "week_end": self.today.isoformat()},
+                              lambda d: isinstance(d, dict) and d.get("report"),
+                              "missing report"),
+        }
+        for label, (_kind, body, predicate, why) in analyses.items():
+            result = self.add(Case(f"ai analyze {label}", "POST",
+                                   f"/api/ai/analyze/{PROJECT_ID}",
+                                   json_body=body, expect={200}))
+            self.assert_result(f"ai analyze {label} shape", result, predicate, why)
+
+        self.add(Case("ai analyze rejects missing gate_id", "POST",
+                      f"/api/ai/analyze/{PROJECT_ID}",
+                      json_body={"analysis_type": "gate_assessment"},
+                      expect={400}))
+        self.add(Case("ai analyze rejects unknown type", "POST",
+                      f"/api/ai/analyze/{PROJECT_ID}",
+                      json_body={"analysis_type": "not_a_real_analysis"},
+                      expect={400}))
+
         self.add(Case("generate planning periods", "POST",
                       f"/api/planning/generate/{PROJECT_ID}", expect={200}))
         assessed = self.add(Case("assess stage gate", "POST",

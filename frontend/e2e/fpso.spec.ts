@@ -101,6 +101,33 @@ test('signs in, renders every dashboard tab, and logs out', async ({ page }) => 
     await page.waitForTimeout(500);
   }
 
+  // Exercise the four AI analysis actions; each must reach a live endpoint.
+  await page.getByRole('button', { name: 'AI Insights', exact: true }).click();
+  await expect(page.getByRole('heading', { level: 2, name: 'AI Insights', exact: true })).toBeVisible();
+  const analyzeButtons = page.getByRole('button', { name: 'Analyze', exact: true });
+  await expect(analyzeButtons).toHaveCount(4);
+
+  // Schedule Risk (0), Conflict Detection (1) and Weekly Report (3) call the API.
+  for (const index of [0, 1, 3]) {
+    const responsePromise = page.waitForResponse(
+      (response) =>
+        response.url().includes('/api/ai/analyze/') && response.request().method() === 'POST',
+      { timeout: 30_000 }
+    );
+    await analyzeButtons.nth(index).click();
+    const response = await responsePromise;
+    expect(response.status(), `analysis request index ${index}`).toBe(200);
+    await expect(page.getByText('Analysis failed')).toHaveCount(0);
+  }
+
+  // Gate Assessment needs a stage gate. The demo project has none, so the panel
+  // must explain that instead of firing a request the API would reject with 400.
+  await analyzeButtons.nth(2).click();
+  await expect(
+    page.getByText('No stage gates are available to assess for this project.')
+  ).toBeVisible();
+  await expect(page.getByText('Analysis failed')).toHaveCount(0);
+
   expect(apiFailures, `API 5xx responses: ${apiFailures.join(', ')}`).toEqual([]);
   expect(pageErrors, `Uncaught page errors: ${pageErrors.join(' | ')}`).toEqual([]);
 

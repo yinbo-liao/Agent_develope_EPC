@@ -52,6 +52,13 @@ export function AIInsightPanel({ projectId }: { projectId: string }) {
     refetchInterval: 30000,
   });
 
+  // Gate assessment requires a concrete gate id; use the project's first gate.
+  const { data: stageGates } = useQuery({
+    queryKey: ['stage-gates', projectId],
+    queryFn: () => apiClient.get(`/api/stagegate/${projectId}`),
+    staleTime: 30000,
+  });
+
   const status = aiStatus?.data || {};
   const insightData = insights?.data || {};
 
@@ -83,18 +90,33 @@ export function AIInsightPanel({ projectId }: { projectId: string }) {
     setRunning(type);
     setResult(null);
     try {
-      const payload: any = { analysis_type: type };
+      const payload: { analysis_type: string; week_end?: string; gate_id?: string } = {
+        analysis_type: type,
+      };
       if (type === 'weekly_report') {
         payload.week_end = new Date().toISOString().slice(0, 10);
+      }
+      if (type === 'gate_assessment') {
+        const gates = Array.isArray(stageGates?.data) ? stageGates.data : [];
+        const gateId = gates[0]?.gate_id;
+        if (!gateId) {
+          setResult({
+            type,
+            error: 'No stage gates are available to assess for this project.',
+          });
+          return;
+        }
+        payload.gate_id = gateId;
       }
       const res = await apiClient.post(`/api/ai/analyze/${projectId}`, payload);
       setResult({ type, data: res.data });
       queryClient.invalidateQueries({ queryKey: ['ai-insights'] });
       queryClient.invalidateQueries({ queryKey: ['stage-gates'] });
-    } catch (e) {
+    } catch {
       setResult({ type, error: 'Analysis failed' });
+    } finally {
+      setRunning(null);
     }
-    setRunning(null);
   };
 
   if (collapsed) {

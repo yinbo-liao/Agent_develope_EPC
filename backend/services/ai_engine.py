@@ -311,13 +311,14 @@ class AIEngine:
             f"**Status**: {project.get('current_status', 'N/A')}",
             "",
             "## Task Summary",
-            f"- Total tasks: {tasks.get('total', 0)}, Completed: {tasks.get('completed', 0)}",
-            f"- Average actual completion: {tasks.get('avg_actual', 0):.1f}%",
+            f"- Total tasks: {tasks.get('total') or 0}, Completed: {tasks.get('completed') or 0}",
+            f"- Average actual completion: {tasks.get('avg_actual') or 0:.1f}%",
             "",
             "## NDT Progress",
         ]
         for n in ndt:
-            lines.append(f"- {n['ndt_method']}: {n['total']} requests, {n['avg_pct']:.0f}% complete")
+            lines.append(f"- {n['ndt_method']}: {n['total'] or 0} requests, "
+                         f"{n.get('avg_pct') or 0:.0f}% complete")
         if shortages:
             lines.append("\n## Top Resource Shortages")
             for s in shortages:

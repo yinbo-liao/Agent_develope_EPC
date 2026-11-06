@@ -8,7 +8,7 @@ import sqlite3
 import uuid
 import json
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -1915,6 +1915,54 @@ async def ai_chat_dev(project_id: str, request: AIChatRequest):
             "fallback_used": True,
             "error": str(e),
         }
+
+
+class AIAnalysisRequest(BaseModel):
+    analysis_type: str
+    gate_id: Optional[str] = None
+    week_end: Optional[str] = None
+
+
+@ai_router.post("/analyze/{project_id}")
+async def ai_analyze_dev(project_id: str, request: AIAnalysisRequest):
+    """Run a rule-based analysis (mirrors routers/ai.py for the SQLite backend)."""
+    from services import ai_engine
+
+    if request.analysis_type == "schedule_risk":
+        return await ai_engine.ai_engine.analyze_schedule_risk(project_id, pool)
+
+    if request.analysis_type == "conflict_detection":
+        conflicts = await ai_engine.ai_engine.detect_conflicts(project_id, pool)
+        return {"conflicts_found": len(conflicts), "conflicts": conflicts}
+
+    if request.analysis_type == "gate_assessment":
+        if not request.gate_id:
+            raise HTTPException(status_code=400,
+                                detail="gate_id required for gate_assessment")
+        result = await ai_engine.ai_engine.assess_stage_gate(
+            project_id, request.gate_id, pool)
+        if "ai_readiness_score" in result:
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    "UPDATE stage_gates SET ai_readiness_score = ? "
+                    "WHERE gate_id = ? AND project_id = ?",
+                    [result["ai_readiness_score"], request.gate_id, project_id],
+                )
+        return result
+
+    if request.analysis_type == "weekly_report":
+        try:
+            week_end = date.fromisoformat(request.week_end) if request.week_end \
+                else date.today()
+        except ValueError:
+            raise HTTPException(status_code=400,
+                                detail="week_end must be an ISO date (YYYY-MM-DD)")
+        report = await ai_engine.ai_engine.compose_weekly_report(
+            project_id, week_end, pool)
+        return {"report": report, "week_end": week_end.isoformat()}
+
+    raise HTTPException(status_code=400,
+                        detail=f"Unknown analysis_type: {request.analysis_type}")
 
 
 @ai_router.get("/insights/{project_id}")

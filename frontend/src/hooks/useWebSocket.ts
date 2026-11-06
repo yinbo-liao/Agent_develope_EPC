@@ -12,6 +12,8 @@ const BACKOFF_MULTIPLIER = 2;
 const JITTER_RATIO = 0.2;
 const HEARTBEAT_INTERVAL_MS = 30000;
 const AUTH_FAILURE_CLOSE_CODE = 1008;
+/** How long a socket must stay open before another auth retry is allowed. */
+const HEALTHY_CONNECTION_MS = 5000;
 
 export interface UseWebSocketOptions {
   /** Send a `{"type":"ping"}` heartbeat every 30s while connected. */
@@ -33,6 +35,7 @@ export function useWebSocket(
 ) {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const healthTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const reconnectAttemptRef = useRef(0);
   const shouldReconnectRef = useRef(true);
@@ -61,6 +64,13 @@ export function useWebSocket(
     if (reconnectTimeoutRef.current) {
       clearTimeout(reconnectTimeoutRef.current);
       reconnectTimeoutRef.current = null;
+    }
+  }, []);
+
+  const clearHealthTimer = useCallback(() => {
+    if (healthTimerRef.current) {
+      clearTimeout(healthTimerRef.current);
+      healthTimerRef.current = null;
     }
   }, []);
 
@@ -105,8 +115,15 @@ export function useWebSocket(
 
     ws.onopen = () => {
       reconnectAttemptRef.current = 0; // Reset backoff on success
-      authRetryRef.current = false;
       stopHeartbeat();
+      // Only re-arm the single auth retry once the socket has proven healthy.
+      // A server may accept the handshake and then close with 1008; clearing
+      // the flag here immediately would create an endless refresh loop.
+      clearHealthTimer();
+      healthTimerRef.current = setTimeout(() => {
+        authRetryRef.current = false;
+        healthTimerRef.current = null;
+      }, HEALTHY_CONNECTION_MS);
       if (heartbeatEnabledRef.current) {
         heartbeatRef.current = setInterval(() => {
           if (ws.readyState === WebSocket.OPEN) {
@@ -130,6 +147,7 @@ export function useWebSocket(
 
     ws.onclose = (event) => {
       stopHeartbeat();
+      clearHealthTimer();
       if (wsRef.current === ws) {
         wsRef.current = null;
       }
@@ -158,7 +176,7 @@ export function useWebSocket(
 
       scheduleReconnect();
     };
-  }, [projectId, scheduleReconnect, stopHeartbeat]);
+  }, [projectId, scheduleReconnect, stopHeartbeat, clearHealthTimer]);
 
   useEffect(() => {
     connectRef.current = connect;
@@ -173,6 +191,7 @@ export function useWebSocket(
     return () => {
       shouldReconnectRef.current = false;
       clearReconnectTimer();
+      clearHealthTimer();
       stopHeartbeat();
 
       const ws = wsRef.current;
@@ -190,5 +209,5 @@ export function useWebSocket(
         }
       }
     };
-  }, [connect, clearReconnectTimer, stopHeartbeat]);
+  }, [connect, clearReconnectTimer, clearHealthTimer, stopHeartbeat]);
 }
