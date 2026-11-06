@@ -30,6 +30,15 @@ from services.tools.schema import (
 
 logger = logging.getLogger(__name__)
 
+
+def _validate_input(model_cls, **kwargs):
+    """Validate tool arguments against the registered Pydantic schema.
+
+    Raises pydantic.ValidationError; the registry wrapper converts that into a
+    ToolResult(success=False), so bad LLM arguments never reach raw SQL.
+    """
+    return model_cls(**kwargs)
+
 # ── Tool 1: Query Activities ─────────────────────────────────────────────
 
 @tool_registry.register(
@@ -51,6 +60,9 @@ async def query_activities(pool, project_id: str, status: str | None = None,
                            is_critical: bool | None = None, work_scope_category: str | None = None,
                            limit: int = 50):
     """Query schedule activities from the database."""
+    _validate_input(QueryActivitiesInput, project_id=project_id, status=status,
+                    is_critical=is_critical, work_scope_category=work_scope_category,
+                    limit=limit)
     query = """SELECT activity_code, activity_name, status, is_critical,
                       physical_percent_complete, remaining_duration, original_duration,
                       total_float, work_scope_category
@@ -94,6 +106,8 @@ async def query_drawings(pool, project_id: str, discipline_name: str | None = No
                          status: str | None = None, drawing_type: str | None = None,
                          limit: int = 50):
     """Query engineering drawings from the database."""
+    _validate_input(QueryDrawingsInput, project_id=project_id, discipline_name=discipline_name,
+                    status=status, drawing_type=drawing_type, limit=limit)
     query = """SELECT d.drawing_number, d.drawing_title, d.status, d.drawing_type,
                       d.planned_issue_date, d.actual_issue_date, d.revision,
                       ed.discipline_name, d.issued_for_info, d.issued_for_construction
@@ -139,6 +153,8 @@ async def query_procurement(pool, project_id: str, vendor_name: str | None = Non
                             status: str | None = None, material_type: str | None = None,
                             limit: int = 50):
     """Query procurement purchase orders from the database."""
+    _validate_input(QueryProcurementInput, project_id=project_id, vendor_name=vendor_name,
+                    status=status, material_type=material_type, limit=limit)
     query = """SELECT po.po_number, po.vendor_name, po.order_date, po.expected_delivery_date,
                       po.actual_delivery_date, po.status, po.total_amount,
                       pi.material_type, pi.quantity_ordered, pi.quantity_received,
@@ -186,23 +202,31 @@ async def query_quality_ncr(pool, project_id: str, severity: str | None = None,
                             status: str | None = None, discipline_name: str | None = None,
                             from_date: str | None = None, limit: int = 50):
     """Query quality NCRs from the database."""
-    query = """SELECT ncr_number, title, description, severity, status,
-                      discipline_name, root_cause, corrective_action,
-                      raised_date, closed_date, system_code
-               FROM quality_ncr WHERE project_id = $1"""
+    _validate_input(QueryQualityNCRInput, project_id=project_id, severity=severity,
+                    status=status, discipline_name=discipline_name,
+                    from_date=from_date, limit=limit)
+    # quality_ncr has no `title`, `discipline_name`, `closed_date` or
+    # `system_code` columns: the discipline name comes from the join and the
+    # closeout date is actual_closeout_date.
+    query = """SELECT ncr.ncr_number, ncr.description, ncr.severity, ncr.status,
+                      ed.discipline_name, ncr.root_cause, ncr.corrective_action,
+                      ncr.raised_date, ncr.actual_closeout_date AS closed_date
+               FROM quality_ncr ncr
+               LEFT JOIN engineering_disciplines ed ON ncr.discipline_id = ed.discipline_id
+               WHERE ncr.project_id = $1"""
     params = [project_id]
     idx = 2
 
     if severity:
-        query += f" AND severity = ${idx}"; params.append(severity); idx += 1
+        query += f" AND ncr.severity = ${idx}"; params.append(severity); idx += 1
     if status:
-        query += f" AND status = ${idx}"; params.append(status); idx += 1
+        query += f" AND ncr.status = ${idx}"; params.append(status); idx += 1
     if discipline_name:
-        query += f" AND discipline_name = ${idx}"; params.append(discipline_name); idx += 1
+        query += f" AND ed.discipline_name = ${idx}"; params.append(discipline_name); idx += 1
     if from_date:
-        query += f" AND raised_date >= ${idx}::date"; params.append(from_date); idx += 1
+        query += f" AND ncr.raised_date >= ${idx}::date"; params.append(from_date); idx += 1
 
-    query += f" ORDER BY raised_date DESC LIMIT ${idx}"
+    query += f" ORDER BY ncr.raised_date DESC LIMIT ${idx}"
     params.append(limit)
 
     async with pool.acquire() as conn:
@@ -231,9 +255,14 @@ async def query_safety_incidents(pool, project_id: str, incident_type: str | Non
                                  severity: str | None = None, from_date: str | None = None,
                                  limit: int = 50):
     """Query safety incidents from the database."""
+    _validate_input(QuerySafetyIncidentsInput, project_id=project_id,
+                    incident_type=incident_type, severity=severity,
+                    from_date=from_date, limit=limit)
+    # Actual columns: corrective_action (singular), status/investigated_by,
+    # and area_code (there is no `location` column).
     query = """SELECT incident_date, incident_type, severity, description,
-                      investigation_status, corrective_actions, lost_time_days,
-                      location, reported_by
+                      status AS investigation_status, corrective_action,
+                      lost_time_days, area_code AS location, reported_by
                FROM safety_incidents WHERE project_id = $1"""
     params = [project_id]
     idx = 2
@@ -275,11 +304,17 @@ async def query_training_records(pool, project_id: str, personnel_name: str | No
                                  certification_expired: bool | None = None,
                                  limit: int = 50):
     """Query training records from the database."""
-    query = """SELECT p.full_name, p.role, p.trade, tc.course_name,
-                      ptr.completion_date, ptr.expiry_date, ptr.status,
+    _validate_input(QueryTrainingRecordsInput, project_id=project_id,
+                    personnel_name=personnel_name, course_name=course_name,
+                    certification_expired=certification_expired, limit=limit)
+    # personnel has role_id/discipline (not `role`/`trade`), and
+    # personnel_training has no `status` column.
+    query = """SELECT p.full_name, tr.role_name AS role, p.discipline AS trade,
+                      tc.course_name, ptr.completion_date, ptr.expiry_date,
                       CASE WHEN ptr.expiry_date < CURRENT_DATE THEN TRUE ELSE FALSE END AS is_expired
                FROM personnel_training ptr
                JOIN personnel p ON ptr.personnel_id = p.personnel_id
+               LEFT JOIN training_roles tr ON p.role_id = tr.role_id
                JOIN training_courses tc ON ptr.course_id = tc.course_id
                WHERE p.project_id = $1"""
     params = [project_id]
@@ -290,7 +325,8 @@ async def query_training_records(pool, project_id: str, personnel_name: str | No
     if course_name:
         query += f" AND tc.course_name ILIKE ${idx}"; params.append(f"%{course_name}%"); idx += 1
     if certification_expired:
-        query += f" AND ptr.expiry_date < CURRENT_DATE"; idx += 1
+        # No placeholder is introduced here, so `idx` must not advance.
+        query += " AND ptr.expiry_date < CURRENT_DATE"
 
     query += f" ORDER BY ptr.expiry_date ASC NULLS LAST LIMIT ${idx}"
     params.append(limit)
@@ -317,9 +353,13 @@ async def query_training_records(pool, project_id: str, personnel_name: str | No
 )
 async def query_stage_gates(pool, project_id: str, status: str | None = None, limit: int = 20):
     """Query stage gates from the database."""
+    _validate_input(QueryStageGatesInput, project_id=project_id, status=status, limit=limit)
+    # Actual columns: human_approver / approval_date, and the checklist PK is
+    # checklist_item_id (not item_id).
     query = """SELECT sg.gate_name, sg.from_phase, sg.to_phase, sg.status,
-                      sg.ai_readiness_score, sg.approved_by, sg.approved_at,
-                      COUNT(sgc.item_id) AS total_checklist,
+                      sg.ai_readiness_score, sg.human_approver,
+                      sg.approval_date AS approved_at,
+                      COUNT(sgc.checklist_item_id) AS total_checklist,
                       SUM(CASE WHEN sgc.is_complete THEN 1 ELSE 0 END) AS completed_checklist
                FROM stage_gates sg
                LEFT JOIN stage_gate_checklist sgc ON sg.gate_id = sgc.gate_id
@@ -359,6 +399,8 @@ async def query_conflicts(pool, project_id: str, conflict_type: str | None = Non
                           severity: str | None = None, status: str | None = None,
                           limit: int = 50):
     """Query conflicts from the database."""
+    _validate_input(QueryConflictsInput, project_id=project_id, conflict_type=conflict_type,
+                    severity=severity, status=status, limit=limit)
     query = """SELECT c.title, c.description, c.conflict_type, c.severity, c.status,
                       c.detected_by_agent, c.ai_confidence, c.ai_recommendation,
                       c.created_at, c.resolved_at
@@ -398,6 +440,8 @@ async def query_conflicts(pool, project_id: str, conflict_type: str | None = Non
 )
 async def query_traceability(pool, project_id: str, entity_type: str, entity_id: str):
     """Query traceability chain from the database via the traceability service."""
+    _validate_input(QueryTraceabilityInput, project_id=project_id,
+                    entity_type=entity_type, entity_id=entity_id)
     from services.traceability_service import TraceabilityService
 
     if entity_type == "drawing":
@@ -425,6 +469,7 @@ async def query_traceability(pool, project_id: str, entity_type: str, entity_id:
 )
 async def calculate_kpi(pool, project_id: str):
     """Calculate comprehensive project KPIs."""
+    _validate_input(CalculateKPIInput, project_id=project_id)
     async with pool.acquire() as conn:
         # Project overview
         project = await conn.fetchrow("SELECT * FROM projects WHERE project_id = $1", project_id)
@@ -517,6 +562,8 @@ async def calculate_kpi(pool, project_id: str):
 )
 async def generate_report(pool, project_id: str, report_type: str = "weekly", week_end: str | None = None):
     """Generate a structured report section from KPI data."""
+    _validate_input(GenerateReportInput, project_id=project_id,
+                    report_type=report_type, week_end=week_end)
     # First get KPIs — use keyword args since tools are wrapped with **kwargs
     kpis_result = await calculate_kpi(pool=pool, project_id=project_id)
     kpis = kpis_result.data if hasattr(kpis_result, 'data') else kpis_result

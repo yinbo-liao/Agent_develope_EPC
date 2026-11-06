@@ -42,14 +42,13 @@ CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user ON refresh_tokens(user_id);
 CREATE INDEX IF NOT EXISTS idx_auth_audit_user ON auth_audit_log(user_id);
 CREATE INDEX IF NOT EXISTS idx_auth_audit_created ON auth_audit_log(created_at);
 
--- Default admin user (password: admin123 — change immediately in production)
--- Password hash generated with: python -c "from passlib.context import CryptContext; print(CryptContext(schemes=['bcrypt']).hash('admin123'))"
-INSERT INTO users (user_id, username, email, hashed_password, full_name, role)
-VALUES (
-    gen_random_uuid(),
-    'admin',
-    'admin@fpso-epc.local',
-    '$2b$12$LJ3m4ys3Lk0TSwHCpNqrTeqMD7ZgDcZEMaDQarBUKPJV3qKoCLrXq',
-    'System Administrator',
-    'admin'
-) ON CONFLICT (username) DO NOTHING;
+-- No default admin is seeded here on purpose: shipping a known password hash is
+-- a credential exposure. On startup the application creates the first admin
+-- from FPSO_BOOTSTRAP_ADMIN_USERNAME / FPSO_BOOTSTRAP_ADMIN_PASSWORD when the
+-- users table is empty (see auth.bootstrap_admin). Production refuses to start
+-- with an empty users table and no bootstrap password.
+--
+-- To create an admin manually instead:
+--   python -c "from auth import hash_password; print(hash_password('use-a-long-random-password'))"
+--   INSERT INTO users (username, email, hashed_password, role)
+--   VALUES ('admin', 'admin@example.com', '<hash>', 'admin');

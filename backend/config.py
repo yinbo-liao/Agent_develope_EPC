@@ -1,14 +1,33 @@
+import logging
+from typing import Literal
+
 from pydantic_settings import BaseSettings
-from pydantic import ValidationError
-import sys
+
+logger = logging.getLogger(__name__)
+
+# Values that must never be used as a JWT signing key in production.
+_UNSAFE_SECRET_KEYS = {"", "change-me-in-production"}
 
 
 class Settings(BaseSettings):
+    # Deployment environment
+    environment: Literal["development", "test", "production"] = "development"
+
     # Database & Cache
     database_url: str = ""
     redis_url: str = "redis://localhost:6379"
     secret_key: str = ""
     cors_origins: list[str] = ["http://localhost:5173", "http://localhost:3000"]
+    trusted_hosts: list[str] = ["localhost", "127.0.0.1", "testserver"]
+
+    # Authentication / Authorization
+    auth_enforcement: bool = True
+    bootstrap_admin_username: str = "admin"
+    bootstrap_admin_password: str = ""
+    dev_admin_password: str = "dev-admin-password"
+
+    # Logging
+    log_format: str = "json"
 
     # Alert Service
     alert_check_interval_minutes: int = 360
@@ -51,8 +70,40 @@ class Settings(BaseSettings):
 
 settings = Settings()
 
-# Validate critical secrets on startup
-if not settings.secret_key:
-    print("WARNING: FPSO_SECRET_KEY is not set. Authentication will be insecure.")
-if not settings.database_url:
-    print("WARNING: FPSO_DATABASE_URL is not set. Database connections will fail.")
+
+def validate_runtime_config() -> list[str]:
+    """Validate security-critical configuration at application startup.
+
+    In production, any problem raises RuntimeError so the process fails closed.
+    In development/test, problems are logged as warnings and startup continues.
+
+    Returns the list of problems found (empty when configuration is valid).
+    """
+    problems: list[str] = []
+
+    secret = settings.secret_key or ""
+    if not secret:
+        problems.append("FPSO_SECRET_KEY is not set")
+    elif secret in _UNSAFE_SECRET_KEYS:
+        problems.append("FPSO_SECRET_KEY is still set to an insecure default")
+    elif len(secret) < 32:
+        problems.append("FPSO_SECRET_KEY is shorter than 32 characters")
+
+    if not settings.database_url:
+        problems.append("FPSO_DATABASE_URL is not set")
+
+    if "*" in settings.cors_origins:
+        problems.append("FPSO_CORS_ORIGINS must not contain '*' (wildcard)")
+
+    if settings.environment == "production":
+        if problems:
+            raise RuntimeError(
+                "Refusing to start in production with invalid configuration: "
+                + "; ".join(problems)
+            )
+    else:
+        for problem in problems:
+            logger.warning("Configuration warning (non-fatal in %s): %s",
+                           settings.environment, problem)
+
+    return problems

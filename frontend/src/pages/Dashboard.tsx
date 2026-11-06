@@ -1,6 +1,6 @@
 import { useParams } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Card, CardHeader, CardTitle, CardContent } from '../components/ui/Card';
 import { Badge } from '../components/ui/Badge';
 import { DisciplineDeliverables } from '../components/engineering/DisciplineDeliverables';
@@ -24,11 +24,12 @@ import { FeedbackLoopDashboard } from '../components/feedback/FeedbackLoopDashbo
 import { TraceabilityChain } from '../components/integration/TraceabilityChain';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { apiClient } from '../lib/api-client';
+import { useOptionalAuth } from '../auth/context';
 import {
   Activity, BarChart3, AlertTriangle, Wrench, Home, FileText,
   ShoppingCart, HardHat, ClipboardCheck, FileBarChart, Menu, X,
   Calendar, Layers, Zap, Shield, Siren, GraduationCap, DoorOpen,
-  Brain, MessageSquare, Link,
+  Brain, MessageSquare, Link, LogOut,
 } from 'lucide-react';
 
 const NAV_ITEMS = [
@@ -55,6 +56,7 @@ export function Dashboard() {
   const { projectId } = useParams<{ projectId: string }>();
   const [activeNav, setActiveNav] = useState('overview');
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const auth = useOptionalAuth();
   const today = new Date();
   const weekStart = new Date(today);
   weekStart.setDate(today.getDate() - today.getDay());
@@ -79,6 +81,16 @@ export function Dashboard() {
   const project = dashData?.data?.project;
   const activities = dashData?.data?.activities;
   const alerts = alertsData?.data || [];
+
+  useEffect(() => {
+    document.title = project?.project_name
+      ? `${project.project_name} — FPSO Project Control`
+      : 'FPSO EPC Project Control';
+  }, [project?.project_name]);
+
+  const user = auth?.user;
+  const displayName = user?.full_name || user?.username || '';
+  const roleLabel = user?.role ? user.role.replace(/_/g, ' ') : '';
 
   return (
     <div className="min-h-screen bg-slate-950 flex">
@@ -159,6 +171,23 @@ export function Dashboard() {
               <Badge variant={project?.current_status === 'ACTIVE' ? 'success' : 'warning'} className="text-[10px]">
                 {project?.current_status || 'N/A'}
               </Badge>
+              {user && (
+                <div className="flex items-center gap-2 pl-2 ml-1 border-l border-slate-800">
+                  <div className="hidden sm:block text-right max-w-[160px]">
+                    <p className="text-xs font-medium text-white truncate">{displayName}</p>
+                    <p className="text-[10px] text-slate-400 uppercase tracking-wide truncate">{roleLabel}</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => { void auth?.logout(); }}
+                    aria-label="Log out"
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 px-2.5 py-1.5 text-xs font-medium text-slate-300 hover:text-white hover:bg-slate-800 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary-light focus-visible:ring-offset-2 focus-visible:ring-offset-slate-900"
+                  >
+                    <LogOut className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span className="hidden lg:inline">Log out</span>
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         </header>

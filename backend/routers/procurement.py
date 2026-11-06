@@ -8,6 +8,14 @@ from database import get_db
 
 router = APIRouter(prefix="/api/procurement", tags=["procurement"])
 
+MAX_PAGE_SIZE = 500
+
+
+def clamp_page(page: int, page_size: int) -> tuple[int, int]:
+    page = max(1, page)
+    page_size = max(1, min(page_size, MAX_PAGE_SIZE))
+    return page, page_size
+
 
 class POItem(BaseModel):
     material_type: str
@@ -52,6 +60,7 @@ async def create_po(project_id: str, po_data: POCreate, db: AsyncSession = Depen
 
 @router.get("/purchase-orders/{project_id}")
 async def list_pos(project_id: str, page: int = 1, page_size: int = 50, db: AsyncSession = Depends(get_db)):
+    page, page_size = clamp_page(page, page_size)
     total_result = await db.execute(
         text("SELECT COUNT(*) FROM procurement_purchase_orders WHERE project_id = :pid"),
         {"pid": project_id}
@@ -77,18 +86,27 @@ async def list_pos(project_id: str, page: int = 1, page_size: int = 50, db: Asyn
 async def get_material_totals(project_id: str, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         text("SELECT pi.material_type, SUM(pi.quantity_ordered * COALESCE(mto.unit_weight_kg, 0)) AS total_weight_kg "
-             "FROM purchase_items pi LEFT JOIN material_takeoff mto ON pi.material_type = mto.material_type AND pi.material_spec = mto.material_spec "
-             "WHERE pi.po_id IN (SELECT po_id FROM procurement_purchase_orders WHERE project_id = :pid) GROUP BY pi.material_type"),
+             "FROM purchase_items pi LEFT JOIN material_takeoff mto ON pi.material_type = mto.material_type "
+             "AND pi.material_spec = mto.material_spec AND mto.project_id = :pid "
+             "WHERE pi.po_id IN (SELECT po_id FROM procurement_purchase_orders WHERE project_id = :pid) "
+             "GROUP BY pi.material_type"),
         {"pid": project_id}
     )
     return {"material_weight_totals": [dict(r._mapping) for r in result]}
 
 
 @router.patch("/material-receipt/{purchase_item_id}")
-async def record_receipt(purchase_item_id: str, data: MaterialReceipt, db: AsyncSession = Depends(get_db)):
-    await db.execute(
-        text("UPDATE purchase_items SET quantity_received = :qty, received_date = COALESCE(:rdate, CURRENT_DATE) WHERE purchase_item_id = :pid"),
-        {"qty": data.quantity_received, "rdate": data.received_date, "pid": purchase_item_id}
-    )
+async def record_receipt(purchase_item_id: str, data: MaterialReceipt,
+                         project_id: Optional[str] = None,
+                         db: AsyncSession = Depends(get_db)):
+    query = ("UPDATE purchase_items SET quantity_received = :qty, "
+             "received_date = COALESCE(:rdate, CURRENT_DATE) WHERE purchase_item_id = :pid")
+    params = {"qty": data.quantity_received, "rdate": data.received_date, "pid": purchase_item_id}
+    if project_id:
+        # purchase_items has no project column; scope through its PO.
+        query += (" AND po_id IN (SELECT po_id FROM procurement_purchase_orders "
+                  "WHERE project_id = :proj_pid)")
+        params["proj_pid"] = project_id
+    await db.execute(text(query), params)
     await db.commit()
     return {"status": "updated"}

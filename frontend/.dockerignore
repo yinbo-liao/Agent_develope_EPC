@@ -1,0 +1,20 @@
+# Frontend build context (frontend/) — never copy host node_modules over the
+# container-installed tree (native binaries differ between Windows and Linux).
+node_modules/
+dist/
+coverage/
+.vite/
+
+npm-debug.log*
+yarn-error.log*
+*.log
+
+.env
+.env.*
+!.env.example
+
+.git
+.gitignore
+
+Dockerfile
+.dockerignore

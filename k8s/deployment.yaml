@@ -1,11 +1,157 @@
+# =============================================================================
+# FPSO EPC Project Control System — Kubernetes baseline
+#
+# Apply with:
+#   kubectl apply -f k8s/deployment.yaml
+#
+# Prerequisites (created out of band, never committed):
+#   kubectl -n fpso create secret generic fpso-backend-secret \
+#     --from-literal=FPSO_SECRET_KEY="$(openssl rand -base64 48)" \
+#     --from-literal=FPSO_DATABASE_URL="postgresql+asyncpg://user:pass@postgres:5432/fpso_db" \
+#     --from-literal=FPSO_BOOTSTRAP_ADMIN_PASSWORD="$(openssl rand -base64 24)" \
+#     --from-literal=PGPASSWORD="<database password>"
+#
+#   # Migration SQL files bundled into a ConfigMap (keys become file paths):
+#   kubectl -n fpso create configmap fpso-migrations \
+#     --from-file=init.sql=database/init.sql \
+#     --from-file=001_extended_schema.sql=database/migrations/001_extended_schema.sql \
+#     --from-file=002_auth_schema.sql=database/migrations/002_auth_schema.sql \
+#     --from-file=003_rag_schema.sql=database/migrations/003_rag_schema.sql \
+#     --from-file=004_auth_hardening.sql=database/migrations/004_auth_hardening.sql \
+#     --from-file=005_reliability_constraints.sql=database/migrations/005_reliability_constraints.sql
+#     # add new migrations here as they are introduced
+#
+#   # The runner script:
+#   kubectl -n fpso create configmap fpso-migrate-script \
+#     --from-file=db-migrate.sh=scripts/db-migrate.sh
+#
+# Order: run the migration Job first and wait for completion before rolling the
+# API (the Deployment does not block on a Job automatically):
+#   kubectl -n fpso delete job fpso-migrate --ignore-not-found
+#   kubectl -n fpso apply -f k8s/deployment.yaml
+#   kubectl -n fpso wait --for=condition=complete job/fpso-migrate --timeout=300s
+#   kubectl -n fpso rollout status deployment/fpso-backend
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fpso-backend-config
+  labels:
+    app.kubernetes.io/part-of: fpso-epc
+data:
+  FPSO_ENVIRONMENT: "production"
+  FPSO_LOG_FORMAT: "json"
+  FPSO_CORS_ORIGINS: '["https://fpso.example.com"]'
+  # TrustedHostMiddleware rejects unknown Host headers (probes and nginx must
+  # match one of these).
+  FPSO_TRUSTED_HOSTS: '["fpso.example.com","backend","localhost","127.0.0.1"]'
+  FPSO_REDIS_URL: "redis://redis:6379/0"
+  FPSO_AI_ENABLED: "false"
+  # Migration Job connection parameters
+  PGHOST: "postgres"
+  PGPORT: "5432"
+  PGUSER: "fpso_user"
+  PGDATABASE: "fpso_db"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fpso-migrate
+  labels:
+    app: fpso-migrate
+    app.kubernetes.io/part-of: fpso-epc
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: fpso-migrate
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 70          # `postgres` user in the official alpine image
+        runAsGroup: 70
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: postgres:16-alpine
+          command: ["/bin/sh", "/scripts/db-migrate.sh"]
+          envFrom:
+            - configMapRef:
+                name: fpso-backend-config
+          env:
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fpso-backend-secret
+                  key: PGPASSWORD
+            - name: SQL_ROOT
+              value: /sql
+          volumeMounts:
+            - name: sql
+              mountPath: /sql
+              readOnly: true
+            - name: migrate-script
+              mountPath: /scripts
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: sql
+          configMap:
+            name: fpso-migrations
+            items:
+              - key: init.sql
+                path: init.sql
+              - key: 001_extended_schema.sql
+                path: migrations/001_extended_schema.sql
+              - key: 002_auth_schema.sql
+                path: migrations/002_auth_schema.sql
+              - key: 003_rag_schema.sql
+                path: migrations/003_rag_schema.sql
+              - key: 004_auth_hardening.sql
+                path: migrations/004_auth_hardening.sql
+              - key: 005_reliability_constraints.sql
+                path: migrations/005_reliability_constraints.sql
+        - name: migrate-script
+          configMap:
+            name: fpso-migrate-script
+            defaultMode: 0555
+        - name: tmp
+          emptyDir: {}
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: backend
+  name: fpso-backend
   labels:
     app: fpso-backend
+    app.kubernetes.io/part-of: fpso-epc
 spec:
   replicas: 3
+  revisionHistoryLimit: 5
+  minReadySeconds: 10
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app: fpso-backend
@@ -13,71 +159,146 @@ spec:
     metadata:
       labels:
         app: fpso-backend
+      # NOTE: /metrics is restricted to loopback or an admin bearer token, so
+      # this pod is not annotated for annotation-based Prometheus scraping.
+      # Configure a ServiceMonitor/static scrape with an admin token instead.
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
-      - name: backend
-        image: ghcr.io/your-org/fpso-backend:latest
-        ports:
-        - containerPort: 8000
-        env:
-        - name: FPSO_DATABASE_URL
-          valueFrom:
-            secretKeyRef:
-              name: db-secret
-              key: url
-        - name: FPSO_REDIS_URL
-          valueFrom:
-            secretKeyRef:
-              name: redis-secret
-              key: url
-        resources:
-          requests: { cpu: 500m, memory: 512Mi }
-          limits: { cpu: 1000m, memory: 1Gi }
-        readinessProbe:
-          httpGet:
-            path: /health
-            port: 8000
-          initialDelaySeconds: 5
-          periodSeconds: 10
+        - name: backend
+          image: ghcr.io/your-org/fpso-backend:4.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: fpso-backend-config
+            - secretRef:
+                name: fpso-backend-secret
+          resources:
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          # Probes connect over loopback and send Host: 127.0.0.1, which is in
+          # FPSO_TRUSTED_HOSTS. Without `host`, the kubelet sends the pod IP as
+          # the Host header and TrustedHostMiddleware answers 400.
+          # Startup probe tolerates slow first connects while the pool warms up.
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+              host: 127.0.0.1
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 30
+          # Readiness verifies the database via /health/ready (503 when down).
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+              host: 127.0.0.1
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          # Liveness is dependency-free: a DB/Redis outage must not restart pods.
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+              host: 127.0.0.1
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 64Mi
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: backend
+  labels:
+    app: fpso-backend
 spec:
+  type: ClusterIP
   selector:
     app: fpso-backend
   ports:
-  - port: 8000
-    targetPort: 8000
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: fpso-backend
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: fpso-backend
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: backend-hpa
+  name: fpso-backend
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: backend
+    name: fpso-backend
   minReplicas: 3
   maxReplicas: 10
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
   metrics:
-  - type: Resource
-    resource:
-      name: cpu
-      target:
-        type: Utilization
-        averageUtilization: 70
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: frontend
+  name: fpso-frontend
   labels:
     app: fpso-frontend
+    app.kubernetes.io/part-of: fpso-epc
 spec:
   replicas: 2
+  revisionHistoryLimit: 5
+  minReadySeconds: 5
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app: fpso-frontend
@@ -86,23 +307,161 @@ spec:
       labels:
         app: fpso-frontend
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101       # `nginx` user in nginx:*-alpine
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+        # Lets the non-root nginx bind port 80 (safe, namespaced sysctl).
+        # If the cluster forbids this, switch nginx to listen on 8080.
+        sysctls:
+          - name: net.ipv4.ip_unprivileged_port_start
+            value: "0"
       containers:
-      - name: frontend
-        image: ghcr.io/your-org/fpso-frontend:latest
-        ports:
-        - containerPort: 80
-        resources:
-          requests: { cpu: 250m, memory: 256Mi }
-          limits: { cpu: 500m, memory: 512Mi }
+        - name: frontend
+          image: ghcr.io/your-org/fpso-frontend:4.0.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: cache
+              mountPath: /var/cache/nginx
+            - name: run
+              mountPath: /run
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: cache
+          emptyDir: {}
+        - name: run
+          emptyDir: {}
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Mi
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: frontend
+  labels:
+    app: fpso-frontend
 spec:
   type: ClusterIP
   selector:
     app: fpso-frontend
   ports:
-  - port: 80
-    targetPort: 80
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: fpso-frontend
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: fpso-frontend
+---
+# --- Optional network policies -------------------------------------------------
+# These assume the ingress controller lives in the `ingress-nginx` namespace.
+# Adjust or delete if the cluster handles north/south traffic differently.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fpso-backend
+spec:
+  podSelector:
+    matchLabels:
+      app: fpso-backend
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: fpso-frontend
+      ports:
+        - protocol: TCP
+          port: 8000
+  egress:
+    # DNS
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # PostgreSQL / Redis (in-cluster or reachable within the cluster network)
+    - ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 6379
+    # LLM provider APIs and other HTTPS egress
+    - ports:
+        - protocol: TCP
+          port: 443
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fpso-frontend
+spec:
+  podSelector:
+    matchLabels:
+      app: fpso-frontend
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - protocol: TCP
+          port: 80
+  egress:
+    - ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app: fpso-backend
+      ports:
+        - protocol: TCP
+          port: 8000

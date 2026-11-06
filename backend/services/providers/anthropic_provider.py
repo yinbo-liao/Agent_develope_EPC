@@ -20,8 +20,8 @@ class AnthropicProvider:
         self.model = model
         self._client = None
 
-    @property
-    def client(self):
+    def _ensure_client(self):
+        """Construct the AsyncAnthropic client on first use."""
         if self._client is None and self.api_key:
             try:
                 import anthropic
@@ -32,8 +32,25 @@ class AnthropicProvider:
         return self._client
 
     @property
+    def client(self):
+        return self._ensure_client()
+
+    @property
     def available(self) -> bool:
-        return bool(self.api_key) and self._client is not None
+        """True when an API key is configured and the SDK client can be built.
+
+        Previously this returned False until `chat()` had already run (client
+        was never constructed eagerly), which disabled the fallback provider
+        on the first request.
+        """
+        if not self.api_key:
+            return False
+        if self._client is None:
+            try:
+                self._ensure_client()
+            except Exception:  # SDK missing or construction failure
+                return False
+        return self._client is not None
 
     async def chat(
         self,

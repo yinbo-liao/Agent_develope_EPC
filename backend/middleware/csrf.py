@@ -2,14 +2,19 @@
 CSRF Protection Middleware
 
 Validates Origin/Referer headers for state-changing requests (POST/PUT/PATCH/DELETE).
-Rejects requests with mismatched or missing Origin headers.
 
-For SPAs served from the same origin, this is sufficient protection against CSRF.
-For cross-origin API access, use the CSRF token pattern (next phase).
+- Origins are matched exactly against ``settings.cors_origins`` (a prefix match
+  would let ``http://localhost:5173.evil.com`` through).
+- In production, a mutating request with neither Origin nor Referer is rejected.
+- In development/test, requests without those headers are allowed so CLI tools
+  and the test suite keep working.
 """
 
 import logging
-from fastapi import Request, HTTPException, status
+from urllib.parse import urlsplit
+
+from fastapi import Request, status
+from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from config import settings
@@ -19,6 +24,27 @@ logger = logging.getLogger(__name__)
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
 
 
+def _normalized_origins() -> set[str]:
+    return {origin.rstrip("/").lower() for origin in settings.cors_origins}
+
+
+def _origin_of(url: str) -> str | None:
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    if not parts.scheme or not parts.netloc:
+        return None
+    return f"{parts.scheme}://{parts.netloc}".lower()
+
+
+def _forbidden(detail: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content={"detail": detail, "code": "CSRF_REJECTED", "context": None},
+    )
+
+
 class CSRFTokenMiddleware(BaseHTTPMiddleware):
     """Origin/Referer header validation for state-changing requests."""
 
@@ -26,37 +52,29 @@ class CSRFTokenMiddleware(BaseHTTPMiddleware):
         if request.method.upper() in SAFE_METHODS:
             return await call_next(request)
 
-        # In development, allow requests without Origin checks
-        # In production, validate Origin against allowed CORS origins
         origin = request.headers.get("origin")
         referer = request.headers.get("referer")
+        allowed = _normalized_origins()
 
-        allowed_origins = settings.cors_origins
-
-        # If no Origin/Referer and not in dev mode, reject
         if not origin and not referer:
-            logger.warning(f"CSRF: No Origin/Referer on {request.method} {request.url.path}")
-            # For API clients (Postman, curl), allow if they have valid auth
-            # (auth dependency handles that separately)
+            if settings.environment == "production":
+                logger.warning("CSRF: No Origin/Referer on %s %s",
+                               request.method, request.url.path)
+                return _forbidden("Origin or Referer header is required.")
+            # Development/test: allow API clients without browser headers.
             return await call_next(request)
 
-        # Validate Origin
-        if origin:
-            if any(origin.startswith(allowed.rstrip("/")) or origin == allowed
-                   for allowed in allowed_origins):
-                return await call_next(request)
+        if origin and origin.rstrip("/").lower() in allowed:
+            return await call_next(request)
 
-        # Validate Referer as fallback
         if referer:
-            if any(referer.startswith(allowed.rstrip("/")) or referer.startswith(allowed)
-                   for allowed in allowed_origins):
+            referer_origin = _origin_of(referer)
+            if referer_origin and referer_origin.rstrip("/") in allowed:
                 return await call_next(request)
 
-        logger.warning(f"CSRF: Invalid Origin '{origin}' for {request.method} {request.url.path}")
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Cross-origin request rejected. Invalid Origin header.",
-        )
+        logger.warning("CSRF: Invalid Origin '%s' for %s %s",
+                       origin, request.method, request.url.path)
+        return _forbidden("Cross-origin request rejected. Invalid Origin header.")
 
 
 def add_csrf_middleware(app):

@@ -1,4 +1,11 @@
-"""Conflict Detection & Resolution router — cross-phase conflict management."""
+"""Conflict Detection & Resolution router — cross-phase conflict management.
+
+Route ordering note: FastAPI matches routes in registration order. Static
+segments (`/summary`, `/actions`) MUST be registered before the one- and
+two-segment dynamic routes (`/{project_id}`, `/{project_id}/{conflict_id}`),
+otherwise `GET /api/conflicts/summary/<pid>` resolves as
+`GET /api/conflicts/{project_id}` with `project_id="summary"`.
+"""
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
@@ -7,8 +14,17 @@ from datetime import date
 from typing import Optional
 from database import get_db
 from errors import not_found, bad_request
+from auth import get_current_user, TokenData
 
 router = APIRouter(prefix="/api/conflicts", tags=["conflicts"])
+
+MAX_PAGE_SIZE = 500
+
+
+def clamp_page(page: int, page_size: int) -> tuple[int, int]:
+    page = max(1, page)
+    page_size = max(1, min(page_size, MAX_PAGE_SIZE))
+    return page, page_size
 
 
 # ---- Pydantic Schemas ----
@@ -30,7 +46,7 @@ class ConflictCreate(BaseModel):
 class ConflictUpdate(BaseModel):
     status: Optional[str] = None
     resolution_notes: Optional[str] = None
-    resolved_by: Optional[str] = None
+    resolved_by: Optional[str] = None  # ignored — identity comes from the token
 
 
 class ConflictActionCreate(BaseModel):
@@ -43,6 +59,107 @@ class ConflictActionCreate(BaseModel):
 class ConflictActionUpdate(BaseModel):
     status: Optional[str] = None
     completion_date: Optional[date] = None
+
+
+# ---- Static routes (must precede dynamic routes) ----
+
+@router.get("/summary/{project_id}")
+async def conflict_summary(project_id: str, db: AsyncSession = Depends(get_db)):
+    """Dashboard summary of all conflicts."""
+    by_type = await db.execute(
+        text("""SELECT conflict_type, COUNT(*) AS count,
+                       SUM(CASE WHEN status IN ('RESOLVED', 'CLOSED') THEN 1 ELSE 0 END) AS resolved
+                FROM conflicts WHERE project_id = :pid
+                GROUP BY conflict_type ORDER BY count DESC"""),
+        {"pid": project_id}
+    )
+    by_severity = await db.execute(
+        text("""SELECT severity, COUNT(*) AS count,
+                       SUM(CASE WHEN status IN ('DETECTED', 'ACKNOWLEDGED', 'IN_RESOLUTION') THEN 1 ELSE 0 END) AS open
+                FROM conflicts WHERE project_id = :pid
+                GROUP BY severity ORDER BY severity"""),
+        {"pid": project_id}
+    )
+    ai_stats = await db.execute(
+        text("""SELECT detected_by_agent, COUNT(*) AS count,
+                       ROUND(AVG(COALESCE(ai_confidence, 0))::numeric, 2) AS avg_confidence
+                FROM conflicts WHERE project_id = :pid
+                GROUP BY detected_by_agent"""),
+        {"pid": project_id}
+    )
+    return {
+        "by_type": [dict(r._mapping) for r in by_type],
+        "by_severity": [dict(r._mapping) for r in by_severity],
+        "ai_detection_stats": [dict(r._mapping) for r in ai_stats],
+    }
+
+
+# ---- Conflict Actions (static prefix `/actions`) ----
+
+@router.post("/actions/{project_id}")
+async def create_action(project_id: str, data: ConflictActionCreate, db: AsyncSession = Depends(get_db)):
+    # Parent conflict must belong to the path project.
+    parent = await db.execute(
+        text("SELECT conflict_id FROM conflicts WHERE conflict_id = :cid AND project_id = :pid"),
+        {"cid": data.conflict_id, "pid": project_id},
+    )
+    if parent.fetchone() is None:
+        raise not_found("Conflict", data.conflict_id)
+
+    await db.execute(
+        text("""INSERT INTO conflict_actions (action_id, conflict_id, action_description, assigned_to, target_date)
+                VALUES (gen_random_uuid(), :cid, :desc, :assign, :tdate)"""),
+        {"cid": data.conflict_id, "desc": data.action_description,
+         "assign": data.assigned_to, "tdate": data.target_date}
+    )
+    await db.commit()
+    return {"status": "created"}
+
+
+@router.get("/actions/{project_id}")
+async def list_actions(project_id: str, conflict_id: Optional[str] = None,
+                       assigned_to: Optional[str] = None,
+                       page: int = 1, page_size: int = 50,
+                       db: AsyncSession = Depends(get_db)):
+    page, page_size = clamp_page(page, page_size)
+    query = """SELECT ca.*, c.title AS conflict_title, c.conflict_type, c.severity
+               FROM conflict_actions ca
+               JOIN conflicts c ON ca.conflict_id = c.conflict_id
+               WHERE c.project_id = :pid"""
+    params = {"pid": project_id}
+    if conflict_id:
+        query += " AND ca.conflict_id = :cid"
+        params["cid"] = conflict_id
+    if assigned_to:
+        query += " AND ca.assigned_to = :assign"
+        params["assign"] = assigned_to
+    query += " ORDER BY ca.target_date LIMIT :limit OFFSET :offset"
+    params["limit"] = page_size
+    params["offset"] = (page - 1) * page_size
+
+    result = await db.execute(text(query), params)
+    return [dict(r._mapping) for r in result]
+
+
+@router.patch("/actions/{project_id}/{action_id}")
+async def update_action(project_id: str, action_id: str, data: ConflictActionUpdate,
+                        db: AsyncSession = Depends(get_db)):
+    updates = []
+    params = {"pid": project_id, "aid": action_id}
+    for field in ["status", "completion_date"]:
+        val = getattr(data, field, None)
+        if val is not None:
+            updates.append(f"{field} = :{field}")
+            params[field] = val
+    if not updates:
+        return {"status": "no changes"}
+    await db.execute(
+        text(f"UPDATE conflict_actions SET {', '.join(updates)} WHERE action_id = :aid "
+             "AND conflict_id IN (SELECT conflict_id FROM conflicts WHERE project_id = :pid)"),
+        params
+    )
+    await db.commit()
+    return {"status": "updated"}
 
 
 # ---- Conflicts ----
@@ -74,8 +191,11 @@ async def list_conflicts(
     severity: Optional[str] = None,
     conflict_type: Optional[str] = None,
     detected_by_agent: Optional[bool] = None,
+    page: int = 1,
+    page_size: int = 50,
     db: AsyncSession = Depends(get_db),
 ):
+    page, page_size = clamp_page(page, page_size)
     query = """SELECT c.*, COALESCE(ca.action_count, 0) AS open_actions
                FROM conflicts c
                LEFT JOIN (
@@ -97,7 +217,10 @@ async def list_conflicts(
     if detected_by_agent is not None:
         query += " AND c.detected_by_agent = :agent"
         params["agent"] = detected_by_agent
-    query += " ORDER BY CASE c.severity WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 ELSE 2 END, c.created_at DESC"
+    query += (" ORDER BY CASE c.severity WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 ELSE 2 END, "
+              "c.created_at DESC LIMIT :limit OFFSET :offset")
+    params["limit"] = page_size
+    params["offset"] = (page - 1) * page_size
 
     result = await db.execute(text(query), params)
     return [dict(r._mapping) for r in result]
@@ -121,16 +244,21 @@ async def get_conflict(project_id: str, conflict_id: str, db: AsyncSession = Dep
 
 
 @router.patch("/{project_id}/{conflict_id}")
-async def update_conflict(project_id: str, conflict_id: str, data: ConflictUpdate, db: AsyncSession = Depends(get_db)):
+async def update_conflict(project_id: str, conflict_id: str, data: ConflictUpdate,
+                          db: AsyncSession = Depends(get_db),
+                          user: TokenData = Depends(get_current_user)):
     updates = []
     params = {"pid": project_id, "cid": conflict_id}
-    for field in ["status", "resolution_notes", "resolved_by"]:
+    for field in ["status", "resolution_notes"]:
         val = getattr(data, field, None)
         if val is not None:
             updates.append(f"{field} = :{field}")
             params[field] = val
     if data.status == "RESOLVED":
         updates.append("resolved_at = NOW()")
+        # Resolution identity is derived from the token, never the body.
+        updates.append("resolved_by = :resolved_by")
+        params["resolved_by"] = user.username
     if not updates:
         return {"status": "no changes"}
     await db.execute(
@@ -139,88 +267,3 @@ async def update_conflict(project_id: str, conflict_id: str, data: ConflictUpdat
     )
     await db.commit()
     return {"status": "updated"}
-
-
-# ---- Conflict Actions ----
-
-@router.post("/actions/{project_id}")
-async def create_action(project_id: str, data: ConflictActionCreate, db: AsyncSession = Depends(get_db)):
-    await db.execute(
-        text("""INSERT INTO conflict_actions (action_id, conflict_id, action_description, assigned_to, target_date)
-                VALUES (gen_random_uuid(), :cid, :desc, :assign, :tdate)"""),
-        {"cid": data.conflict_id, "desc": data.action_description,
-         "assign": data.assigned_to, "tdate": data.target_date}
-    )
-    await db.commit()
-    return {"status": "created"}
-
-
-@router.patch("/actions/{project_id}/{action_id}")
-async def update_action(project_id: str, action_id: str, data: ConflictActionUpdate, db: AsyncSession = Depends(get_db)):
-    updates = []
-    params = {"pid": project_id, "aid": action_id}
-    for field in ["status", "completion_date"]:
-        val = getattr(data, field, None)
-        if val is not None:
-            updates.append(f"{field} = :{field}")
-            params[field] = val
-    if not updates:
-        return {"status": "no changes"}
-    await db.execute(
-        text(f"UPDATE conflict_actions SET {', '.join(updates)} WHERE action_id = :aid"),
-        params
-    )
-    await db.commit()
-    return {"status": "updated"}
-
-
-@router.get("/actions/{project_id}")
-async def list_actions(project_id: str, conflict_id: Optional[str] = None, assigned_to: Optional[str] = None, db: AsyncSession = Depends(get_db)):
-    query = """SELECT ca.*, c.title AS conflict_title, c.conflict_type, c.severity
-               FROM conflict_actions ca
-               JOIN conflicts c ON ca.conflict_id = c.conflict_id
-               WHERE c.project_id = :pid"""
-    params = {"pid": project_id}
-    if conflict_id:
-        query += " AND ca.conflict_id = :cid"
-        params["cid"] = conflict_id
-    if assigned_to:
-        query += " AND ca.assigned_to = :assign"
-        params["assign"] = assigned_to
-    query += " ORDER BY ca.target_date"
-
-    result = await db.execute(text(query), params)
-    return [dict(r._mapping) for r in result]
-
-
-# ---- Conflict Summary ----
-
-@router.get("/summary/{project_id}")
-async def conflict_summary(project_id: str, db: AsyncSession = Depends(get_db)):
-    """Dashboard summary of all conflicts."""
-    by_type = await db.execute(
-        text("""SELECT conflict_type, COUNT(*) AS count,
-                       SUM(CASE WHEN status IN ('RESOLVED', 'CLOSED') THEN 1 ELSE 0 END) AS resolved
-                FROM conflicts WHERE project_id = :pid
-                GROUP BY conflict_type ORDER BY count DESC"""),
-        {"pid": project_id}
-    )
-    by_severity = await db.execute(
-        text("""SELECT severity, COUNT(*) AS count,
-                       SUM(CASE WHEN status IN ('DETECTED', 'ACKNOWLEDGED', 'IN_RESOLUTION') THEN 1 ELSE 0 END) AS open
-                FROM conflicts WHERE project_id = :pid
-                GROUP BY severity ORDER BY severity"""),
-        {"pid": project_id}
-    )
-    ai_stats = await db.execute(
-        text("""SELECT detected_by_agent, COUNT(*) AS count,
-                       ROUND(AVG(COALESCE(ai_confidence, 0))::numeric, 2) AS avg_confidence
-                FROM conflicts WHERE project_id = :pid
-                GROUP BY detected_by_agent"""),
-        {"pid": project_id}
-    )
-    return {
-        "by_type": [dict(r._mapping) for r in by_type],
-        "by_severity": [dict(r._mapping) for r in by_severity],
-        "ai_detection_stats": [dict(r._mapping) for r in ai_stats],
-    }

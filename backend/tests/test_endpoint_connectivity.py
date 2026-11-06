@@ -8,6 +8,8 @@ Usage:
 Requires the dev server to be running on localhost:8080.
 """
 
+import os
+
 import pytest
 import httpx
 import asyncio
@@ -15,6 +17,32 @@ from datetime import date
 
 BASE_URL = "http://localhost:8080"
 PROJECT_ID = "demo-project"
+
+# Authenticated once per module (the dev server enforces Bearer JWTs on /api/*).
+_ACCESS_TOKEN: str | None = None
+
+
+async def _get_access_token() -> str:
+    global _ACCESS_TOKEN
+    if _ACCESS_TOKEN is None:
+        username = os.getenv("FPSO_DEV_ADMIN_USERNAME", "admin")
+        password = os.getenv("FPSO_DEV_ADMIN_PASSWORD") or "dev-admin-password"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{BASE_URL}/api/auth/login",
+                json={"username": username, "password": password},
+            )
+            response.raise_for_status()
+            _ACCESS_TOKEN = response.json()["access_token"]
+    return _ACCESS_TOKEN
+
+
+async def _auth_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {await _get_access_token()}"}
+
+# These tests make real HTTP calls and require a running dev_main server.
+# Run with:  pytest tests/test_endpoint_connectivity.py -m live
+pytestmark = pytest.mark.live
 
 
 def _clean_response(r: httpx.Response) -> dict:
@@ -36,22 +64,22 @@ def event_loop():
 # ── Helper ───────────────────────────────────────────────────────────────
 
 async def get(path: str, params: dict | None = None) -> httpx.Response:
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=10.0, headers=await _auth_headers()) as client:
         return await client.get(f"{BASE_URL}{path}", params=params)
 
 
 async def post(path: str, json_data: dict | None = None) -> httpx.Response:
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=10.0, headers=await _auth_headers()) as client:
         return await client.post(f"{BASE_URL}{path}", json=json_data or {})
 
 
 async def patch(path: str, json_data: dict | None = None) -> httpx.Response:
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=10.0, headers=await _auth_headers()) as client:
         return await client.patch(f"{BASE_URL}{path}", json=json_data or {})
 
 
 async def delete(path: str) -> httpx.Response:
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=10.0, headers=await _auth_headers()) as client:
         return await client.delete(f"{BASE_URL}{path}")
 
 
@@ -73,16 +101,17 @@ class TestCoreEndpoints:
 class TestAuthEndpoints:
     async def test_login_fails_without_credentials(self):
         r = await post("/api/auth/login")
-        # Dev mode returns 200 with dev-token; prod returns 422
+        # Missing body/credentials are rejected with 422.
         assert r.status_code in (200, 422)
 
     async def test_login_validates_input(self):
         r = await post("/api/auth/login", {"username": "test", "password": "test"})
+        # Unknown credentials are rejected (never a dev bypass token).
         assert r.status_code in (200, 401)
 
     async def test_me_requires_auth(self):
+        # The helper authenticates, so /me returns the seeded dev admin.
         r = await get("/api/auth/me")
-        # Dev mode returns 200 without auth; prod returns 401
         assert r.status_code in (200, 401)
 
 

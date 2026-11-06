@@ -5,8 +5,23 @@ from pydantic import BaseModel
 from datetime import date
 from typing import Optional
 from database import get_db
+from auth import get_current_user, TokenData
 
 router = APIRouter(prefix="/api/construction", tags=["construction"])
+
+MAX_PAGE_SIZE = 500
+
+
+def clamp_page(page: int, page_size: int) -> tuple[int, int]:
+    page = max(1, page)
+    page_size = max(1, min(page_size, MAX_PAGE_SIZE))
+    return page, page_size
+
+
+def sql_in_placeholders(prefix: str, values: list) -> tuple[str, dict]:
+    """Build a portable `:p0, :p1, ...` IN list and its params."""
+    names = [f"{prefix}{i}" for i in range(len(values))]
+    return ", ".join(f":{n}" for n in names), {n: v for n, v in zip(names, values)}
 
 
 class ManpowerRecord(BaseModel):
@@ -102,20 +117,30 @@ async def create_weekly_task(data: WeeklyTaskCreate, db: AsyncSession = Depends(
 
 
 @router.patch("/weekly-planning/{task_id}")
-async def update_weekly_task(task_id: str, data: WeeklyTaskUpdate, db: AsyncSession = Depends(get_db)):
+async def update_weekly_task(task_id: str, data: WeeklyTaskUpdate,
+                             project_id: Optional[str] = None,
+                             db: AsyncSession = Depends(get_db)):
+    scope_sql = " AND project_id = :pid" if project_id else ""
     await db.execute(
-        text("UPDATE weekly_planning_tasks SET actual_completion_percent = :acp, is_completed = :ic, delay_reason = :dr WHERE task_id = :tid"),
-        {"acp": data.actual_completion_percent, "ic": data.is_completed, "dr": data.delay_reason, "tid": task_id}
+        text("UPDATE weekly_planning_tasks SET actual_completion_percent = :acp, "
+             "is_completed = :ic, delay_reason = :dr "
+             f"WHERE task_id = :tid{scope_sql}"),
+        {"acp": data.actual_completion_percent, "ic": data.is_completed,
+         "dr": data.delay_reason, "tid": task_id,
+         **({"pid": project_id} if project_id else {})}
     )
     await db.commit()
     return {"status": "updated"}
 
 
 @router.get("/resource-shortages/{project_id}")
-async def get_open_shortages(project_id: str, db: AsyncSession = Depends(get_db)):
+async def get_open_shortages(project_id: str, page: int = 1, page_size: int = 200,
+                             db: AsyncSession = Depends(get_db)):
+    page, page_size = clamp_page(page, page_size)
     result = await db.execute(
-        text("SELECT * FROM resource_shortages WHERE project_id = :pid AND status = 'OPEN' ORDER BY shortfall DESC"),
-        {"pid": project_id}
+        text("SELECT * FROM resource_shortages WHERE project_id = :pid AND status = 'OPEN' "
+             "ORDER BY shortfall DESC LIMIT :limit OFFSET :offset"),
+        {"pid": project_id, "limit": page_size, "offset": (page - 1) * page_size}
     )
     return [dict(r._mapping) for r in result]
 
@@ -145,6 +170,7 @@ async def get_construction_materials(
     db: AsyncSession = Depends(get_db),
 ):
     """Get construction materials with MVR status, drawing AFC/IFA flags, and PO enrichment."""
+    page, page_size = clamp_page(page, page_size)
     # Count query for pagination
     count_query = (
         "SELECT COUNT(*) FROM drawing_materials dm "
@@ -180,7 +206,19 @@ async def get_construction_materials(
     mat_result = await db.execute(text(mat_query), mat_params)
     mat_rows = [dict(r._mapping) for r in mat_result]
 
-    # Equipment query
+    # Equipment query — paginated and enriched only for the current page
+    eq_count_query = (
+        "SELECT COUNT(*) FROM drawing_equipment de "
+        "JOIN drawings drw ON de.drawing_id = drw.drawing_id "
+        "WHERE de.project_id = :pid"
+    )
+    eq_count_params = {"pid": project_id}
+    if discipline_id:
+        eq_count_query += " AND drw.discipline_id = :did"
+        eq_count_params["did"] = discipline_id
+    eq_total_result = await db.execute(text(eq_count_query), eq_count_params)
+    eq_total = eq_total_result.scalar() or 0
+
     eq_query = (
         "SELECT de.*, drw.drawing_number, drw.drawing_title, drw.revision AS drawing_rev, "
         "drw.issued_for_info, drw.issued_for_construction, "
@@ -194,23 +232,34 @@ async def get_construction_materials(
     if discipline_id:
         eq_query += " AND drw.discipline_id = :did"
         eq_params["did"] = discipline_id
-    eq_query += " ORDER BY ed.discipline_id, drw.drawing_number, de.equipment_tag"
+    eq_query += (" ORDER BY ed.discipline_id, drw.drawing_number, de.equipment_tag "
+                 "LIMIT :limit OFFSET :offset")
+    eq_params["limit"] = page_size
+    eq_params["offset"] = (page - 1) * page_size
 
     eq_result = await db.execute(text(eq_query), eq_params)
     eq_rows = [dict(r._mapping) for r in eq_result]
 
-    # PO enrichment for materials
+    # PO enrichment for materials — only the current page, project-scoped, and
+    # matched on a composite key (material_type + grade/spec) instead of
+    # material_type alone, which pulled the wrong PO.
     po_map = {}
     if mat_rows:
         material_ids = [m["material_id"] for m in mat_rows]
-        # Build PO lookup: material_type → PO for each material
+        in_sql, in_params = sql_in_placeholders("mid", material_ids)
         po_result = await db.execute(
-            text("""SELECT dm.material_id, pi.po_id, po.po_number, po.status AS po_status
+            text(f"""SELECT dm.material_id, pi.po_id, po.po_number, po.status AS po_status
                     FROM drawing_materials dm
                     JOIN purchase_items pi ON dm.material_type = pi.material_type
+                        AND (
+                            pi.material_spec IS NULL
+                            OR dm.material_grade = pi.material_spec
+                            OR dm.material_class = pi.material_spec
+                        )
                     JOIN procurement_purchase_orders po ON pi.po_id = po.po_id
-                    WHERE dm.project_id = :pid AND po.project_id = :pid2"""),
-            {"pid": project_id, "pid2": project_id}
+                    WHERE dm.project_id = :pid AND po.project_id = :pid
+                      AND dm.material_id IN ({in_sql})"""),
+            {"pid": project_id, **in_params}
         )
         for r in po_result:
             row = dict(r._mapping)
@@ -245,6 +294,7 @@ async def get_construction_materials(
         equipment.append(item)
 
     total_pages = max(1, (total + page_size - 1) // page_size)
+    eq_total_pages = max(1, (eq_total + page_size - 1) // page_size)
     return {
         "materials": materials,
         "equipment": equipment,
@@ -252,28 +302,40 @@ async def get_construction_materials(
             "total": total, "page": page, "page_size": page_size,
             "total_pages": total_pages, "has_next": page < total_pages, "has_prev": page > 1,
         },
+        "equipment_pagination": {
+            "total": eq_total, "page": page, "page_size": page_size,
+            "total_pages": eq_total_pages, "has_next": page < eq_total_pages, "has_prev": page > 1,
+        },
     }
 
 
 # ── MVR Status Update ────────────────────────────────────────────────
 
 @router.patch("/mvr-status/{material_id}")
-async def update_mvr_status(material_id: str, data: MvrStatusUpdate, db: AsyncSession = Depends(get_db)):
-    """Update MVR status. MVR-confirm requires AFC drawing."""
+async def update_mvr_status(material_id: str, data: MvrStatusUpdate,
+                            project_id: Optional[str] = None,
+                            db: AsyncSession = Depends(get_db),
+                            user: TokenData = Depends(get_current_user)):
+    """Update MVR status. MVR-confirm requires AFC drawing.
+
+    `project_id` is an optional scope guard; `confirmed_by` always comes from
+    the authenticated token, never the request body.
+    """
     new_status = data.mvr_status
-    confirmed_by = data.confirmed_by
+    confirmed_by = user.username
 
     valid_statuses = {"Info-AFI", "Structure-requested", "MVR-confirm"}
     if new_status not in valid_statuses:
         return {"status": "error", "message": f"Invalid MVR status: {new_status}. Must be one of: {valid_statuses}"}
 
     # Check drawing AFC status
+    scope_sql = " AND dm.project_id = :pid" if project_id else ""
     result = await db.execute(
         text("SELECT drw.issued_for_construction, drw.issued_for_info "
              "FROM drawing_materials dm "
              "JOIN drawings drw ON dm.drawing_id = drw.drawing_id "
-             "WHERE dm.material_id = :mid"),
-        {"mid": material_id}
+             f"WHERE dm.material_id = :mid{scope_sql}"),
+        {"mid": material_id, **({"pid": project_id} if project_id else {})}
     )
     row = result.fetchone()
     if not row:
@@ -294,10 +356,12 @@ async def update_mvr_status(material_id: str, data: MvrStatusUpdate, db: AsyncSe
     # Update MVR status
     from datetime import datetime
     now = datetime.now().isoformat() if new_status == "MVR-confirm" else None
+    update_scope = " AND project_id = :pid" if project_id else ""
     await db.execute(
         text("UPDATE drawing_materials SET mvr_status = :st, mvr_confirmed_by = :by, "
-             "mvr_confirmed_at = :ts WHERE material_id = :mid"),
-        {"st": new_status, "by": confirmed_by, "ts": now, "mid": material_id}
+             f"mvr_confirmed_at = :ts WHERE material_id = :mid{update_scope}"),
+        {"st": new_status, "by": confirmed_by, "ts": now, "mid": material_id,
+         **({"pid": project_id} if project_id else {})}
     )
     await db.commit()
 

@@ -2,12 +2,30 @@
 Development server using SQLite — no PostgreSQL needed.
 Run: python dev_main.py
 """
+import hashlib
+import os
 import sqlite3
 import uuid
 import json
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from datetime import datetime, timedelta, timezone
+
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from starlette.datastructures import Headers
+
+from config import settings
+from auth import (
+    DUMMY_PASSWORD_HASH,
+    REFRESH_TOKEN_EXPIRE_DAYS,
+    create_access_token,
+    create_refresh_token,
+    decode_token,
+    hash_password,
+    has_role,
+    verify_password,
+)
 from websocket import manager
 
 DB_PATH = "dev.db"
@@ -258,6 +276,28 @@ def init_db():
             ip_address TEXT, user_agent TEXT, created_at TEXT DEFAULT (datetime('now'))
         );
     """)
+
+    # Seed a development admin when no users exist. Never in production, and
+    # never with a hardcoded hash — the password comes from the environment.
+    if settings.environment != "production":
+        user_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        if user_count == 0:
+            dev_username = os.getenv("FPSO_DEV_ADMIN_USERNAME", "admin")
+            dev_password = os.getenv("FPSO_DEV_ADMIN_PASSWORD") or settings.dev_admin_password
+            conn.execute(
+                """INSERT INTO users
+                   (user_id, username, email, hashed_password, full_name, role, is_active)
+                   VALUES (?,?,?,?,?,?,1)""",
+                (
+                    str(uuid.uuid4()),
+                    dev_username,
+                    f"{dev_username}@fpso.local",
+                    hash_password(dev_password),
+                    "Development Administrator",
+                    "admin",
+                ),
+            )
+
     # Migration: add columns that may not exist in older dev databases
     try:
         conn.execute("ALTER TABLE drawing_materials ADD COLUMN material_class TEXT DEFAULT NULL")
@@ -730,8 +770,82 @@ async def lifespan(app: FastAPI):
     await pool.close()
 
 
+# Authentication endpoints reachable without a bearer token. /api/auth/logout
+# is intentionally public (it revokes a refresh token supplied in the body).
+DEV_PUBLIC_API_PATHS = {"/api/auth/login", "/api/auth/refresh", "/api/auth/logout"}
+DEV_WRITE_ROLES = ("trade_lead", "project_manager", "admin")
+
+
+class DevAuthMiddleware:
+    """Bearer-JWT enforcement for /api/* on the standalone SQLite server.
+
+    Mirrors the production app: 401 for missing/invalid tokens and 403 for
+    mutating requests from roles below trade_lead.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+        method = scope.get("method", "GET").upper()
+        if (
+            method == "OPTIONS"
+            or not path.startswith("/api/")
+            or path in DEV_PUBLIC_API_PATHS
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        headers = Headers(scope=scope)
+        authorization = headers.get("authorization", "")
+        user = (
+            decode_token(authorization[7:].strip())
+            if authorization.lower().startswith("bearer ")
+            else None
+        )
+
+        if user is None:
+            response = JSONResponse(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                content={
+                    "detail": "Not authenticated. Provide a Bearer token in the Authorization header.",
+                    "code": "UNAUTHORIZED",
+                    "context": None,
+                },
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+            await response(scope, receive, send)
+            return
+
+        if method in {"POST", "PUT", "PATCH", "DELETE"} and user.role not in DEV_WRITE_ROLES:
+            response = JSONResponse(
+                status_code=status.HTTP_403_FORBIDDEN,
+                content={
+                    "detail": "This action requires trade_lead role or higher.",
+                    "code": "forbidden",
+                    "context": None,
+                },
+            )
+            await response(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)
+
+
 app = FastAPI(title="FPSO EPC Project Control System (Dev)", version="4.0", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(DevAuthMiddleware)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key", "X-Correlation-ID"],
+)
 
 
 @app.get("/health")
@@ -739,16 +853,56 @@ async def health():
     return {"status": "healthy", "database": "sqlite", "mode": "development"}
 
 
+def _dev_websocket_token(ws: WebSocket) -> tuple[str | None, str | None]:
+    """Extract a JWT from the WS subprotocol, or ?token= outside production."""
+    offered = ws.headers.get("sec-websocket-protocol", "")
+    for protocol in (p.strip() for p in offered.split(",")):
+        if protocol.startswith("bearer."):
+            return protocol[len("bearer."):], protocol
+    if settings.environment != "production":
+        query_token = ws.query_params.get("token")
+        if query_token:
+            return query_token, None
+    return None, None
+
+
 @app.websocket("/ws/{project_id}")
 async def websocket_endpoint(ws: WebSocket, project_id: str):
-    await manager.connect(ws, project_id)
+    """Authenticated WebSocket channel — mirrors main.py's contract."""
+    token, subprotocol = _dev_websocket_token(ws)
+
+    if not token:
+        await ws.close(code=status.WS_1008_POLICY_VIOLATION,
+                       reason="Missing authentication token")
+        return
+    user = decode_token(token)
+    if user is None:
+        await ws.close(code=status.WS_1008_POLICY_VIOLATION,
+                       reason="Invalid or expired token")
+        return
+
+    # Origin validation for browser clients.
+    origin = ws.headers.get("origin")
+    if origin and not any(
+        origin.rstrip("/") == allowed.rstrip("/") for allowed in settings.cors_origins
+    ):
+        if subprotocol:
+            await ws.accept(subprotocol=subprotocol)
+        else:
+            await ws.accept()
+        await ws.close(code=status.WS_1008_POLICY_VIOLATION, reason="Origin not allowed")
+        return
+
+    # No project_members table in the SQLite dev schema: authentication (plus
+    # the RBAC role carried in the token) is the access boundary here.
+    await manager.connect(ws, project_id, subprotocol=subprotocol)
     try:
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:
-        manager.disconnect(ws, project_id)
+        await manager.disconnect(ws, project_id)
     except Exception:
-        manager.disconnect(ws, project_id)
+        await manager.disconnect(ws, project_id)
 
 
 # ===== Engineering Routes =====
@@ -2081,15 +2235,290 @@ async def impact_dev(project_id: str, entity_type: str, entity_id: str):
 
 
 # ===== Auth Routes (dev mode) =====
+# These mirror the production contract (real bcrypt + real JWTs) so the dev
+# server exercises the same authentication path as main.py.
 auth_dev = APIRouter(prefix="/api/auth", tags=["auth"])
 
+
+def _sqlite_utc(minutes: int = 0, days: int = 0) -> str:
+    return (datetime.now(timezone.utc) + timedelta(days=days, minutes=minutes)).strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+
+def _current_user_from_request(request: Request):
+    authorization = request.headers.get("authorization", "")
+    if not authorization.lower().startswith("bearer "):
+        return None
+    return decode_token(authorization[7:].strip())
+
+
+async def _dev_log_auth_event(user_id, event_type: str, request: Request):
+    if pool is None:
+        return
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO auth_audit_log
+               (log_id, user_id, event_type, ip_address, user_agent)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                str(uuid.uuid4()),
+                user_id,
+                event_type,
+                request.client.host if request.client else None,
+                request.headers.get("user-agent"),
+            ),
+        )
+
+
 @auth_dev.post("/login")
-async def login_dev(data: dict):
-    return {"access_token": "dev-token", "refresh_token": "dev-refresh", "token_type": "bearer", "expires_in": 900}
+async def login_dev(data: dict, request: Request):
+    username = (data or {}).get("username")
+    password = (data or {}).get("password")
+    if not username or not password:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Username and password are required.",
+        )
+    if len(password) > 128:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail="Password too long.")
+
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM users WHERE username = ? AND is_active = 1", username,
+        )
+    user = dict(row) if row else None
+
+    # Constant-time-ish: always run bcrypt, even for unknown usernames.
+    password_hash = user["hashed_password"] if user else DUMMY_PASSWORD_HASH
+    password_ok = verify_password(password, password_hash)
+    if not user or not password_ok:
+        await _dev_log_auth_event(user["user_id"] if user else None, "FAILED_LOGIN", request)
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid username or password.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token_data = {"sub": user["user_id"], "username": user["username"], "role": user["role"]}
+    access_token = create_access_token(token_data)
+    raw_refresh, refresh_hash = create_refresh_token(token_data)
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO refresh_tokens (token_id, user_id, token_hash, expires_at)
+               VALUES (?, ?, ?, ?)""",
+            (str(uuid.uuid4()), user["user_id"], refresh_hash,
+             _sqlite_utc(days=REFRESH_TOKEN_EXPIRE_DAYS)),
+        )
+        await conn.execute(
+            "UPDATE users SET last_login = datetime('now') WHERE user_id = ?",
+            (user["user_id"],),
+        )
+
+    await _dev_log_auth_event(user["user_id"], "LOGIN", request)
+    return {
+        "access_token": access_token,
+        "refresh_token": raw_refresh,
+        "token_type": "bearer",
+        "expires_in": 900,
+    }
+
+
+DEV_ROLES = ("admin", "project_manager", "trade_lead", "viewer")
+
+
+@auth_dev.post("/register")
+async def register_dev(data: dict, request: Request):
+    """Register a new user. Admin only (mirrors routers/auth_router.py)."""
+    caller = _current_user_from_request(request)
+    if caller is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Not authenticated.")
+    if caller.role != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail="This action requires admin role.")
+
+    data = data or {}
+    username = data.get("username") or ""
+    email = data.get("email") or ""
+    password = data.get("password") or ""
+    full_name = data.get("full_name")
+    role = data.get("role", "viewer")
+
+    if len(username) < 3 or len(username) > 100:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail="Username must be 3-100 characters.")
+    if len(password) < 8:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail="Password must be at least 8 characters.")
+    if "@" not in email or len(email) > 255:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail="Invalid email address.")
+    if role not in DEV_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Invalid role. Must be one of: admin, project_manager, trade_lead, viewer.",
+        )
+
+    async with pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            "SELECT user_id FROM users WHERE username = ?", username,
+        )
+    if existing:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="Username already exists.")
+
+    user_id = str(uuid.uuid4())
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO users
+                   (user_id, username, email, hashed_password, full_name, role, is_active)
+                   VALUES (?, ?, ?, ?, ?, ?, 1)""",
+                (user_id, username, email, hash_password(password), full_name, role),
+            )
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT,
+                            detail="Username or email already exists.")
+
+    await _dev_log_auth_event(user_id, "REGISTER", request)
+    return {
+        "user_id": user_id,
+        "username": username,
+        "email": email,
+        "full_name": full_name,
+        "role": role,
+        "is_active": True,
+    }
+
+
+@auth_dev.post("/refresh")
+async def refresh_dev(data: dict, request: Request):
+    raw_token = (data or {}).get("refresh_token")
+    if not raw_token or len(raw_token) > 256:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Invalid refresh token.")
+
+    token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    result = None
+    reuse_user_id = None
+
+    async with pool.acquire() as conn:
+        # SQLite's RETURNING cannot be combined with this pool's eager commit,
+        # so claim the token with a guarded UPDATE after selecting it.
+        claimed = await conn.fetchrow(
+            """SELECT user_id FROM refresh_tokens
+               WHERE token_hash = ? AND revoked = 0 AND expires_at > datetime('now')""",
+            token_hash,
+        )
+        if claimed:
+            await conn.execute(
+                """UPDATE refresh_tokens SET revoked = 1
+                   WHERE token_hash = ? AND revoked = 0""",
+                token_hash,
+            )
+            user_row = await conn.fetchrow(
+                "SELECT user_id, username, role FROM users WHERE user_id = ? AND is_active = 1",
+                claimed["user_id"],
+            )
+            if user_row:
+                token_data = {
+                    "sub": user_row["user_id"],
+                    "username": user_row["username"],
+                    "role": user_row["role"],
+                }
+                access_token = create_access_token(token_data)
+                raw_refresh, new_hash = create_refresh_token(token_data)
+                await conn.execute(
+                    """INSERT INTO refresh_tokens (token_id, user_id, token_hash, expires_at)
+                       VALUES (?, ?, ?, ?)""",
+                    (str(uuid.uuid4()), user_row["user_id"], new_hash,
+                     _sqlite_utc(days=REFRESH_TOKEN_EXPIRE_DAYS)),
+                )
+                result = (user_row["user_id"], access_token, raw_refresh)
+        else:
+            existing = await conn.fetchrow(
+                "SELECT user_id FROM refresh_tokens WHERE token_hash = ?", token_hash,
+            )
+            if existing:
+                reuse_user_id = existing["user_id"]
+                await conn.execute(
+                    "UPDATE refresh_tokens SET revoked = 1 WHERE user_id = ?", (reuse_user_id,),
+                )
+
+    if result is None:
+        if reuse_user_id:
+            await _dev_log_auth_event(reuse_user_id, "REFRESH_REUSE", request)
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Invalid or revoked refresh token.")
+
+    user_id, access_token, raw_refresh = result
+    await _dev_log_auth_event(user_id, "REFRESH", request)
+    return {
+        "access_token": access_token,
+        "refresh_token": raw_refresh,
+        "token_type": "bearer",
+        "expires_in": 900,
+    }
+
+
+@auth_dev.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+async def logout_dev(request: Request, data: dict | None = None):
+    raw_token = (data or {}).get("refresh_token")
+    user_id = None
+    if raw_token and len(raw_token) <= 256:
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+        async with pool.acquire() as conn:
+            existing = await conn.fetchrow(
+                "SELECT user_id FROM refresh_tokens WHERE token_hash = ?", token_hash,
+            )
+            if existing:
+                user_id = existing["user_id"]
+                await conn.execute(
+                    "UPDATE refresh_tokens SET revoked = 1 WHERE token_hash = ?", (token_hash,),
+                )
+        if user_id:
+            await _dev_log_auth_event(user_id, "LOGOUT", request)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@auth_dev.post("/logout-all", status_code=status.HTTP_204_NO_CONTENT)
+async def logout_all_dev(request: Request):
+    user = _current_user_from_request(request)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Not authenticated.")
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE refresh_tokens SET revoked = 1 WHERE user_id = ?", (user.user_id,),
+        )
+    await _dev_log_auth_event(user.user_id, "LOGOUT_ALL", request)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
 
 @auth_dev.get("/me")
-async def me_dev():
-    return {"user_id": "dev-user", "username": "dev", "email": "dev@fpso.local", "role": "admin", "is_active": True}
+async def me_dev(request: Request):
+    user = _current_user_from_request(request)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,
+                            detail="Not authenticated.")
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM users WHERE user_id = ? AND is_active = 1", user.user_id,
+        )
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found.")
+    row = dict(row)
+    return {
+        "user_id": row["user_id"],
+        "username": row["username"],
+        "email": row["email"],
+        "full_name": row.get("full_name"),
+        "role": row["role"],
+        "is_active": bool(row["is_active"]),
+    }
 
 
 # Register all routers
@@ -2111,9 +2540,8 @@ app.include_router(cfl)
 app.include_router(stg)
 app.include_router(fbk)
 app.include_router(trc)
-app.include_router(ai_router)
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("dev_main:app", host="0.0.0.0", port=8080, reload=True)
+    uvicorn.run("dev_main:app", host="127.0.0.1", port=8080, reload=True)

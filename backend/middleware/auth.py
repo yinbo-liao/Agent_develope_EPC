@@ -1,56 +1,71 @@
 """
-API Key Authentication Middleware
+Optional API-key guard (a coarse first line of defence in front of JWT auth).
 
-Simple API key authentication as the first line of defense.
-Protects all routes when FPSO_API_KEY environment variable is set.
+This module is **opt-in**: it does nothing unless ``FPSO_API_KEY`` is set in the
+process environment. It is intentionally *not* wired into the application by
+this module — see the wiring note at the bottom of the file. It is currently
+imported by nothing, so it only takes effect when an application or route
+declares the dependency.
 
-Usage:
-    # Set the key (omit to disable — all requests allowed):
+Usage::
+
     export FPSO_API_KEY=your-secure-key
 
-    # Clients must include:
-    #   Header: X-API-Key: your-secure-key
+    # Per route:
+    @router.get("/path", dependencies=[Depends(verify_api_key)])
+    async def handler(): ...
 
-Full OAuth2+JWT with RBAC should replace this in a subsequent phase.
+    # Or globally (see note below):
+    app = FastAPI(dependencies=[Depends(verify_api_key)])
+
+Clients send ``X-API-Key: <value>``. Comparisons use
+``hmac.compare_digest`` to avoid leaking timing information.
+
+.. warning::
+   If enabled globally, allow health probes and metrics to bypass it — see the
+   wiring note at the bottom of this file. FastAPI-level dependencies do not
+   apply to WebSocket endpoints, so the WebSocket route needs its own check.
 """
 
+import hmac
 import logging
-from fastapi import Request, HTTPException, status
-from fastapi.security import HTTPAuthorizationCredentials
-from config import settings
+import os
+
+from fastapi import HTTPException, Request, status
 
 logger = logging.getLogger(__name__)
 
-# Lazy-loaded API key — only validated once on first request
-_api_key: str | None = None
-_api_key_loaded: bool = False
+# Log the "disabled" warning at most once per process.
+_warned_disabled = False
 
 
 def _get_api_key() -> str | None:
-    """Load API key from environment. Returns None if not configured."""
-    global _api_key, _api_key_loaded
-    if not _api_key_loaded:
-        import os
-        _api_key = os.getenv("FPSO_API_KEY", "").strip() or None
-        _api_key_loaded = True
-        if _api_key:
-            logger.info("API key authentication enabled (FPSO_API_KEY set)")
-        else:
-            logger.warning("API key authentication DISABLED — all requests are public. Set FPSO_API_KEY to enable.")
-    return _api_key
+    """Return the configured API key, or ``None`` when the guard is disabled.
+
+    Read from the environment on every call so tests and container restarts
+    observe changes; the lookup is a cheap dict access.
+    """
+    global _warned_disabled
+    api_key = os.getenv("FPSO_API_KEY", "").strip()
+    if api_key:
+        return api_key
+    if not _warned_disabled:
+        _warned_disabled = True
+        logger.info(
+            "API key authentication DISABLED (FPSO_API_KEY not set). "
+            "All requests pass through this guard."
+        )
+    return None
 
 
 async def verify_api_key(request: Request) -> None:
-    """
-    FastAPI dependency — verifies the X-API-Key header.
-    Add to route dependencies: @router.get("/path", dependencies=[Depends(verify_api_key)])
+    """FastAPI dependency — verify the ``X-API-Key`` header.
 
-    Safe to use as middleware (applies to all routes) or per-route.
-    If FPSO_API_KEY is not set, all requests pass through.
+    No-op when ``FPSO_API_KEY`` is unset. Raises 401 when the header is missing
+    or does not match in constant time.
     """
     expected_key = _get_api_key()
     if expected_key is None:
-        # API key auth not configured — allow all requests
         return
 
     provided_key = request.headers.get("X-API-Key", "")
@@ -61,9 +76,10 @@ async def verify_api_key(request: Request) -> None:
             headers={"WWW-Authenticate": "ApiKey"},
         )
 
-    # Constant-time comparison to prevent timing attacks
-    import hmac
-    if not hmac.compare_digest(provided_key, expected_key):
+    # Compare bytes so non-ASCII input cannot raise TypeError.
+    if not hmac.compare_digest(
+        provided_key.encode("utf-8"), expected_key.encode("utf-8")
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key.",
@@ -72,6 +88,33 @@ async def verify_api_key(request: Request) -> None:
 
 
 def require_auth():
-    """Convenience import for route-level dependencies."""
+    """Convenience helper for route-level dependencies."""
     from fastapi import Depends
+
     return Depends(verify_api_key)
+
+
+# ---------------------------------------------------------------------------
+# Recommended wiring (not applied here; main.py is owned by the app layer)
+# ---------------------------------------------------------------------------
+# A global FastAPI dependency is the simplest correct installation, but it must
+# exempt the routes that infrastructure calls without credentials:
+#
+#   from middleware.auth import verify_api_key
+#
+#   _PUBLIC_PATHS = {"/health", "/health/live", "/health/ready", "/metrics",
+#                    "/docs", "/openapi.json", "/redoc"}
+#
+#   async def api_key_dependency(request: Request) -> None:
+#       if request.url.path in _PUBLIC_PATHS:
+#           return
+#       await verify_api_key(request)
+#
+#   app = FastAPI(..., dependencies=[Depends(api_key_dependency)])
+#
+# WebSockets are NOT covered by dependencies; add the same check in
+# ``websocket_endpoint`` (header ``X-API-Key`` or query parameter).
+#
+# Note: CORS must allow the X-API-Key header (main.py already lists it), and
+# the frontend has no UI to supply the key — keep this opt-in until clients
+# can be configured.

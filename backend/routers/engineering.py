@@ -5,16 +5,31 @@ from pydantic import BaseModel
 from datetime import date
 from typing import Optional
 import csv, io, uuid
-
-DISCIPLINE_NAME_TO_ID = {
-    "STRUCTURAL": 1, "PIPING": 2, "MECHANICAL": 3, "ELECTRICAL": 4, "HVAC": 5,
-}
-DISCIPLINE_ID_TO_NAME = {1: "STRUCTURAL", 2: "PIPING", 3: "MECHANICAL", 4: "ELECTRICAL", 5: "HVAC"}
-from typing import Optional
 from database import get_db
 from pagination import PaginationParams, paginate
 
 router = APIRouter(prefix="/api/engineering", tags=["engineering"])
+
+MAX_PAGE_SIZE = 500
+
+
+def clamp_page(page: int, page_size: int) -> tuple[int, int]:
+    page = max(1, page)
+    page_size = max(1, min(page_size, MAX_PAGE_SIZE))
+    return page, page_size
+
+
+async def get_discipline_maps(db: AsyncSession) -> tuple[dict[str, int], dict[int, str]]:
+    """Load the authoritative discipline name<->id maps from the database.
+
+    The previous hardcoded dicts omitted ARCHITECTURE_DECORATION (discipline 6)
+    and assumed serial IDs, so imports silently rejected valid disciplines.
+    """
+    result = await db.execute(text("SELECT discipline_id, discipline_name FROM engineering_disciplines"))
+    rows = [dict(r._mapping) for r in result]
+    name_to_id = {str(r["discipline_name"]).upper(): r["discipline_id"] for r in rows}
+    id_to_name = {r["discipline_id"]: r["discipline_name"] for r in rows}
+    return name_to_id, id_to_name
 
 
 class DrawingCreate(BaseModel):
@@ -64,15 +79,16 @@ async def get_engineering_summary(project_id: str, db: AsyncSession = Depends(ge
 @router.get("/drawings/{project_id}")
 async def list_drawings(project_id: str, discipline_id: Optional[int] = None,
                         page: int = 1, page_size: int = 50, db: AsyncSession = Depends(get_db)):
+    page, page_size = clamp_page(page, page_size)
     base = ("FROM drawings drw JOIN engineering_disciplines ed ON drw.discipline_id = ed.discipline_id "
             "WHERE drw.project_id = :pid")
-    count_query = text(f"SELECT COUNT(*) {base}")
     params = {"pid": project_id}
+    # Apply every filter BEFORE building/running the count query so the total
+    # reflects the same filter set as the page.
     if discipline_id:
         base += " AND drw.discipline_id = :did"
         params["did"] = discipline_id
-    # Total count
-    total_result = await db.execute(count_query, params)
+    total_result = await db.execute(text(f"SELECT COUNT(*) {base}"), params)
     total = total_result.scalar() or 0
     # Paginated fetch
     query = (f"SELECT drw.*, ed.discipline_name {base} "
@@ -112,9 +128,17 @@ async def get_drawing_materials(
     project_id: str,
     discipline_id: Optional[int] = None,
     drawing_id: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 500,
     db: AsyncSession = Depends(get_db),
 ):
-    """Get drawing materials with procurement planning summary."""
+    """Get drawing materials with procurement planning summary.
+
+    `procurement_planning` is aggregated from the returned page only, keeping
+    the payload bounded. The default page size matches the historical
+    unbounded response for typical projects.
+    """
+    page, page_size = clamp_page(page, page_size)
     query = (
         "SELECT dm.*, drw.drawing_number, drw.drawing_title, drw.revision AS drawing_rev, "
         "drw.issued_for_info, drw.issued_for_construction, "
@@ -130,7 +154,9 @@ async def get_drawing_materials(
     if drawing_id:
         query += " AND dm.drawing_id = :drawid"
         params["drawid"] = drawing_id
-    query += " ORDER BY drw.discipline_id, drw.drawing_number, dm.piece_mark"
+    query += " ORDER BY drw.discipline_id, drw.drawing_number, dm.piece_mark LIMIT :limit OFFSET :offset"
+    params["limit"] = page_size
+    params["offset"] = (page - 1) * page_size
 
     result = await db.execute(text(query), params)
     rows = [dict(r._mapping) for r in result]
@@ -174,9 +200,12 @@ async def get_drawing_materials(
 async def get_drawing_equipment(
     project_id: str,
     discipline_id: Optional[int] = None,
+    page: int = 1,
+    page_size: int = 500,
     db: AsyncSession = Depends(get_db),
 ):
     """Get drawing equipment with procurement planning summary."""
+    page, page_size = clamp_page(page, page_size)
     query = (
         "SELECT de.*, drw.drawing_number, drw.drawing_title, drw.revision AS drawing_rev, "
         "drw.issued_for_info, drw.issued_for_construction, "
@@ -189,7 +218,9 @@ async def get_drawing_equipment(
     if discipline_id:
         query += " AND drw.discipline_id = :did"
         params["did"] = discipline_id
-    query += " ORDER BY drw.discipline_id, drw.drawing_number, de.equipment_tag"
+    query += " ORDER BY drw.discipline_id, drw.drawing_number, de.equipment_tag LIMIT :limit OFFSET :offset"
+    params["limit"] = page_size
+    params["offset"] = (page - 1) * page_size
 
     result = await db.execute(text(query), params)
     rows = [dict(r._mapping) for r in result]
@@ -258,10 +289,13 @@ async def delete_drawing(project_id: str, drawing_id: str, db: AsyncSession = De
     dn = row._mapping["drawing_number"]
     disc = row._mapping["discipline_name"]
 
-    # Cascade delete
-    await db.execute(text("DELETE FROM drawing_materials WHERE drawing_id = :did"), {"did": drawing_id})
-    await db.execute(text("DELETE FROM drawing_equipment WHERE drawing_id = :did"), {"did": drawing_id})
-    await db.execute(text("DELETE FROM material_takeoff WHERE drawing_id = :did"), {"did": drawing_id})
+    # Cascade delete (every delete is project-scoped, not just the drawing row)
+    await db.execute(text("DELETE FROM drawing_materials WHERE drawing_id = :did AND project_id = :pid"),
+                     {"did": drawing_id, "pid": project_id})
+    await db.execute(text("DELETE FROM drawing_equipment WHERE drawing_id = :did AND project_id = :pid"),
+                     {"did": drawing_id, "pid": project_id})
+    await db.execute(text("DELETE FROM material_takeoff WHERE drawing_id = :did AND project_id = :pid"),
+                     {"did": drawing_id, "pid": project_id})
     await db.execute(text("DELETE FROM drawings WHERE drawing_id = :did AND project_id = :pid"),
                      {"did": drawing_id, "pid": project_id})
 
@@ -316,6 +350,7 @@ async def import_drawings_csv(project_id: str, request: Request, db: AsyncSessio
     text_data = body.decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(text_data))
     imported, skipped, errors = 0, 0, []
+    name_to_id, _ = await get_discipline_maps(db)
 
     for row_num, row in enumerate(reader, start=2):
         try:
@@ -323,7 +358,7 @@ async def import_drawings_csv(project_id: str, request: Request, db: AsyncSessio
             if not dn:
                 skipped += 1; continue
             disc_name = (row.get("Discipline") or "").strip().upper()
-            disc_id = DISCIPLINE_NAME_TO_ID.get(disc_name)
+            disc_id = name_to_id.get(disc_name) if disc_name else None
             if not disc_id:
                 errors.append(f"Row {row_num}: unknown discipline '{disc_name}'"); skipped += 1; continue
             title = (row.get("Drawing Title") or "").strip()
@@ -337,18 +372,21 @@ async def import_drawings_csv(project_id: str, request: Request, db: AsyncSessio
             status = "IFC" if ifc == "Yes" else ("IFA" if ifa == "Yes" else "WIP")
 
             drw_id = str(uuid.uuid4())
-            await db.execute(
-                text("""INSERT INTO drawings (drawing_id, project_id, discipline_id, drawing_number,
-                         drawing_title, status, revision, issued_for_info, issued_for_info_date,
-                         issued_for_construction, issued_for_construction_date)
-                        VALUES (:did, :pid, :disc_id, :dn, :title, :status, :rev, :ifa, :ifa_date, :ifc, :ifc_date)"""),
-                {"did": drw_id, "pid": project_id, "disc_id": disc_id, "dn": dn,
-                 "title": title, "status": status, "rev": rev,
-                 "ifa": ifa, "ifa_date": ifa_date, "ifc": ifc, "ifc_date": ifc_date})
-            await db.execute(
-                text("""INSERT INTO change_log (log_id, project_id, entity_type, entity_id, action, entity_number, discipline_name)
-                        VALUES (gen_random_uuid(), :pid, 'drawing', :eid, 'create', :enum, :disc)"""),
-                {"pid": project_id, "eid": drw_id, "enum": dn, "disc": disc_name})
+            # Savepoint per row: a bad row rolls back only itself, leaving the
+            # outer import transaction usable for the remaining rows.
+            async with db.begin_nested():
+                await db.execute(
+                    text("""INSERT INTO drawings (drawing_id, project_id, discipline_id, drawing_number,
+                             drawing_title, status, revision, issued_for_info, issued_for_info_date,
+                             issued_for_construction, issued_for_construction_date)
+                            VALUES (:did, :pid, :disc_id, :dn, :title, :status, :rev, :ifa, :ifa_date, :ifc, :ifc_date)"""),
+                    {"did": drw_id, "pid": project_id, "disc_id": disc_id, "dn": dn,
+                     "title": title, "status": status, "rev": rev,
+                     "ifa": ifa, "ifa_date": ifa_date, "ifc": ifc, "ifc_date": ifc_date})
+                await db.execute(
+                    text("""INSERT INTO change_log (log_id, project_id, entity_type, entity_id, action, entity_number, discipline_name)
+                            VALUES (gen_random_uuid(), :pid, 'drawing', :eid, 'create', :enum, :disc)"""),
+                    {"pid": project_id, "eid": drw_id, "enum": dn, "disc": disc_name})
             imported += 1
         except Exception as e:
             errors.append(f"Row {row_num}: {str(e)}"); skipped += 1
@@ -366,6 +404,7 @@ async def import_materials_csv(project_id: str, request: Request, db: AsyncSessi
     text_data = body.decode("utf-8-sig")
     reader = csv.DictReader(io.StringIO(text_data))
     imported, skipped, errors = 0, 0, []
+    _, id_to_name = await get_discipline_maps(db)
 
     for row_num, row in enumerate(reader, start=2):
         try:
@@ -393,19 +432,20 @@ async def import_materials_csv(project_id: str, request: Request, db: AsyncSessi
 
             mat_id = str(uuid.uuid4())
             disc_id = drw._mapping["discipline_id"]
-            disc_name = DISCIPLINE_ID_TO_NAME.get(disc_id, "UNKNOWN")
-            await db.execute(
-                text("""INSERT INTO drawing_materials (material_id, drawing_id, project_id, piece_mark,
-                         material_grade, material_thickness, material_weight, material_type,
-                         size, diameter, material_length, material_category, total_weight)
-                        VALUES (:mid, :did, :pid, :pm, :grade, :thick, :uwt, :mtype, :sz, :dia, :len, :mcat, :twt)"""),
-                {"mid": mat_id, "did": drw._mapping["drawing_id"], "pid": project_id,
-                 "pm": pm, "grade": grade, "thick": thick, "uwt": unit_wt, "mtype": mtype,
-                 "sz": sz, "dia": dia, "len": length, "mcat": mcat, "twt": total_wt})
-            await db.execute(
-                text("""INSERT INTO change_log (log_id, project_id, entity_type, entity_id, action, entity_number, discipline_name)
-                        VALUES (gen_random_uuid(), :pid, 'material', :eid, 'create', :enum, :disc)"""),
-                {"pid": project_id, "eid": mat_id, "enum": pm, "disc": disc_name})
+            disc_name = id_to_name.get(disc_id, "UNKNOWN")
+            async with db.begin_nested():
+                await db.execute(
+                    text("""INSERT INTO drawing_materials (material_id, drawing_id, project_id, piece_mark,
+                             material_grade, material_thickness, material_weight, material_type,
+                             size, diameter, material_length, material_category, total_weight)
+                            VALUES (:mid, :did, :pid, :pm, :grade, :thick, :uwt, :mtype, :sz, :dia, :len, :mcat, :twt)"""),
+                    {"mid": mat_id, "did": drw._mapping["drawing_id"], "pid": project_id,
+                     "pm": pm, "grade": grade, "thick": thick, "uwt": unit_wt, "mtype": mtype,
+                     "sz": sz, "dia": dia, "len": length, "mcat": mcat, "twt": total_wt})
+                await db.execute(
+                    text("""INSERT INTO change_log (log_id, project_id, entity_type, entity_id, action, entity_number, discipline_name)
+                            VALUES (gen_random_uuid(), :pid, 'material', :eid, 'create', :enum, :disc)"""),
+                    {"pid": project_id, "eid": mat_id, "enum": pm, "disc": disc_name})
             imported += 1
         except Exception as e:
             errors.append(f"Row {row_num}: {str(e)}"); skipped += 1
@@ -452,17 +492,18 @@ async def import_equipment_csv(project_id: str, request: Request, db: AsyncSessi
             inst_date = (row.get("Install Date") or row.get("Schedule Install Date") or "").strip() or None
             remark = (row.get("Remark") or row.get("Remarks") or "").strip() or None
 
-            await db.execute(
-                text("""INSERT INTO drawing_equipment (equipment_id, drawing_id, project_id, equipment_tag,
-                         equipment_name, equipment_detail, install_location, weight, equipment_type,
-                         certification, fat_status, test_status, system_code, system_name,
-                         schedule_delivery_date, schedule_install_date, remark)
-                        VALUES (gen_random_uuid(), :did, :pid, :tag, :name, :detail, :loc, :wt, :etype,
-                                :cert, :fat, :test, :scode, :sname, :ddate, :idate, :remark)"""),
-                {"did": drw._mapping["drawing_id"], "pid": project_id, "tag": tag, "name": name,
-                 "detail": detail, "loc": location, "wt": wt, "etype": etype, "cert": cert,
-                 "fat": fat, "test": test, "scode": sys_code, "sname": sys_name,
-                 "ddate": del_date, "idate": inst_date, "remark": remark})
+            async with db.begin_nested():
+                await db.execute(
+                    text("""INSERT INTO drawing_equipment (equipment_id, drawing_id, project_id, equipment_tag,
+                             equipment_name, equipment_detail, install_location, weight, equipment_type,
+                             certification, fat_status, test_status, system_code, system_name,
+                             schedule_delivery_date, schedule_install_date, remark)
+                            VALUES (gen_random_uuid(), :did, :pid, :tag, :name, :detail, :loc, :wt, :etype,
+                                    :cert, :fat, :test, :scode, :sname, :ddate, :idate, :remark)"""),
+                    {"did": drw._mapping["drawing_id"], "pid": project_id, "tag": tag, "name": name,
+                     "detail": detail, "loc": location, "wt": wt, "etype": etype, "cert": cert,
+                     "fat": fat, "test": test, "scode": sys_code, "sname": sys_name,
+                     "ddate": del_date, "idate": inst_date, "remark": remark})
             imported += 1
         except Exception as e:
             errors.append(f"Row {row_num}: {str(e)}"); skipped += 1

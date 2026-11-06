@@ -38,6 +38,7 @@ async def impact_analysis(project_id: str, entity_type: str, entity_id: str, poo
 
 
 @router.get("/matrix/{project_id}")
-async def traceability_matrix(project_id: str, pool = Depends(get_pool)):
-    """Full project traceability matrix — all drawings with downstream item counts."""
-    return await TraceabilityService.full_traceability_matrix(project_id, pool)
+async def traceability_matrix(project_id: str, page: int = 1, page_size: int = 500,
+                              pool = Depends(get_pool)):
+    """Full project traceability matrix — all drawings with downstream item counts (paginated)."""
+    return await TraceabilityService.full_traceability_matrix(project_id, pool, page, page_size)

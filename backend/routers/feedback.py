@@ -6,8 +6,17 @@ from pydantic import BaseModel
 from datetime import date
 from typing import Optional
 from database import get_db
+from auth import get_current_user, TokenData
 
 router = APIRouter(prefix="/api/feedback", tags=["feedback"])
+
+MAX_PAGE_SIZE = 500
+
+
+def clamp_page(page: int, page_size: int) -> tuple[int, int]:
+    page = max(1, page)
+    page_size = max(1, min(page_size, MAX_PAGE_SIZE))
+    return page, page_size
 
 
 # ---- Pydantic Schemas ----
@@ -32,14 +41,18 @@ class FeedbackUpdate(BaseModel):
 # ---- Feedback Items ----
 
 @router.post("/{project_id}")
-async def create_feedback(project_id: str, data: FeedbackCreate, db: AsyncSession = Depends(get_db)):
+async def create_feedback(project_id: str, data: FeedbackCreate,
+                          db: AsyncSession = Depends(get_db),
+                          user: TokenData = Depends(get_current_user)):
     await db.execute(
         text("""INSERT INTO feedback_loop (feedback_id, project_id, source_stage, target_stage,
                  feedback_type, reference_number, description, impact_level, created_by)
                 VALUES (gen_random_uuid(), :pid, :src, :tgt, :ftype, :ref, :desc, :impact, :by)"""),
         {"pid": project_id, "src": data.source_stage, "tgt": data.target_stage,
          "ftype": data.feedback_type, "ref": data.reference_number,
-         "desc": data.description, "impact": data.impact_level, "by": data.created_by}
+         "desc": data.description, "impact": data.impact_level,
+         # created_by is identity — derived from the token.
+         "by": user.username}
     )
     await db.commit()
     return {"status": "created"}
@@ -51,10 +64,13 @@ async def list_feedback(
     source_stage: Optional[str] = None,
     target_stage: Optional[str] = None,
     is_actioned: Optional[bool] = None,
+    page: int = 1,
+    page_size: int = 500,
     db: AsyncSession = Depends(get_db),
 ):
+    page, page_size = clamp_page(page, page_size)
     query = "SELECT * FROM feedback_loop WHERE project_id = :pid"
-    params = {"pid": project_id}
+    params = {"pid": project_id, "limit": page_size, "offset": (page - 1) * page_size}
     if source_stage:
         query += " AND source_stage = :src"
         params["src"] = source_stage
@@ -64,21 +80,27 @@ async def list_feedback(
     if is_actioned is not None:
         query += " AND is_actioned = :acted"
         params["acted"] = is_actioned
-    query += " ORDER BY created_at DESC"
+    query += " ORDER BY created_at DESC LIMIT :limit OFFSET :offset"
 
     result = await db.execute(text(query), params)
     return [dict(r._mapping) for r in result]
 
 
 @router.patch("/{project_id}/{feedback_id}")
-async def update_feedback(project_id: str, feedback_id: str, data: FeedbackUpdate, db: AsyncSession = Depends(get_db)):
+async def update_feedback(project_id: str, feedback_id: str, data: FeedbackUpdate,
+                          db: AsyncSession = Depends(get_db),
+                          user: TokenData = Depends(get_current_user)):
     updates = []
     params = {"pid": project_id, "fid": feedback_id}
-    for field in ["is_actioned", "actioned_by", "closure_notes", "impact_assessment"]:
+    for field in ["is_actioned", "closure_notes", "impact_assessment"]:
         val = getattr(data, field, None)
         if val is not None:
             updates.append(f"{field} = :{field}")
             params[field] = val
+    # actioned_by is an identity field — derived from the token.
+    if data.actioned_by is not None or data.is_actioned:
+        updates.append("actioned_by = :actioned_by")
+        params["actioned_by"] = user.username
     if data.is_actioned:
         updates.append("actioned_date = NOW()")
     if not updates:
@@ -127,13 +149,17 @@ async def feedback_summary(project_id: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/stale/{project_id}")
-async def stale_feedback(project_id: str, days_stale: int = 14, db: AsyncSession = Depends(get_db)):
+async def stale_feedback(project_id: str, days_stale: int = 14,
+                         page: int = 1, page_size: int = 500,
+                         db: AsyncSession = Depends(get_db)):
     """List unactioned feedback older than N days."""
+    page, page_size = clamp_page(page, page_size)
     result = await db.execute(
         text("""SELECT * FROM feedback_loop
                 WHERE project_id = :pid AND is_actioned = FALSE
                   AND created_at < CURRENT_DATE - :days::INT
-                ORDER BY created_at"""),
-        {"pid": project_id, "days": days_stale}
+                ORDER BY created_at LIMIT :limit OFFSET :offset"""),
+        {"pid": project_id, "days": days_stale,
+         "limit": page_size, "offset": (page - 1) * page_size}
     )
     return [dict(r._mapping) for r in result]

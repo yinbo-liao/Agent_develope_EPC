@@ -118,14 +118,14 @@ class TraceabilityService:
 
             # Commissioning procedures
             procedures = await conn.fetch(
-                "SELECT * FROM commissioning_procedures WHERE sub_system_id = $1",
-                ss["sub_system_id"],
+                "SELECT * FROM commissioning_procedures WHERE sub_system_id = $1 AND project_id = $2",
+                ss["sub_system_id"], project_id,
             )
 
             # Punch items
             punch_items = await conn.fetch(
-                "SELECT * FROM punch_items WHERE sub_system_id = $1",
-                ss["sub_system_id"],
+                "SELECT * FROM punch_items WHERE sub_system_id = $1 AND project_id = $2",
+                ss["sub_system_id"], project_id,
             )
 
             # Related drawings (via discipline)
@@ -185,8 +185,8 @@ class TraceabilityService:
 
                 # Find MTO items linked to this drawing
                 mto = await conn.fetch(
-                    "SELECT * FROM material_takeoff WHERE drawing_id = $1",
-                    entity_id,
+                    "SELECT * FROM material_takeoff WHERE drawing_id = $1 AND project_id = $2",
+                    entity_id, project_id,
                 )
                 # Find POs for these material types
                 mto_types = [m["material_type"] for m in mto]
@@ -202,8 +202,8 @@ class TraceabilityService:
 
                 # Find NDT requests
                 ndt = await conn.fetch(
-                    "SELECT * FROM ndt_requests WHERE drawing_id = $1",
-                    entity_id,
+                    "SELECT * FROM ndt_requests WHERE drawing_id = $1 AND project_id = $2",
+                    entity_id, project_id,
                 )
                 if ndt:
                     affected["drawings"].append({"type": "ndt_requests", "count": len(ndt)})
@@ -220,12 +220,13 @@ class TraceabilityService:
                 if not activity:
                     return {"error": "Entity not found"}
 
-                # Find successor activities
+                # Find successor activities — scope by project to avoid
+                # returning cross-project successors for a shared activity id.
                 successors = await conn.fetch(
                     """SELECT a.* FROM activities a
                        JOIN activity_relationships ar ON a.activity_id = ar.successor_id
-                       WHERE ar.predecessor_id = $1""",
-                    entity_id,
+                       WHERE ar.predecessor_id = $1 AND a.project_id = $2""",
+                    entity_id, project_id,
                 )
                 affected["activities"] = [dict(s) for s in successors]
                 total_impact_items = len(successors)
@@ -240,7 +241,12 @@ class TraceabilityService:
                     return {"error": "Entity not found"}
 
                 # Find construction activities waiting on these materials
-                items = await conn.fetch("SELECT * FROM purchase_items WHERE po_id = $1", entity_id)
+                items = await conn.fetch(
+                    """SELECT pi.* FROM purchase_items pi
+                       JOIN procurement_purchase_orders po ON pi.po_id = po.po_id
+                       WHERE pi.po_id = $1 AND po.project_id = $2""",
+                    entity_id, project_id,
+                )
                 mat_types = [i["material_type"] for i in items]
                 if mat_types:
                     related = await conn.fetch(
@@ -271,8 +277,11 @@ class TraceabilityService:
             }
 
     @staticmethod
-    async def full_traceability_matrix(project_id: str, pool: asyncpg.Pool) -> list[dict]:
-        """Generate a complete traceability matrix for the project."""
+    async def full_traceability_matrix(project_id: str, pool: asyncpg.Pool,
+                                       page: int = 1, page_size: int = 500) -> list[dict]:
+        """Generate a complete traceability matrix for the project (paginated)."""
+        page = max(1, page)
+        page_size = max(1, min(page_size, 500))
         async with pool.acquire() as conn:
             matrix = await conn.fetch(
                 """SELECT
@@ -282,7 +291,7 @@ class TraceabilityService:
                        d.issued_for_construction AS ifc,
                        COUNT(DISTINCT dm.material_id) AS material_count,
                        COUNT(DISTINCT de.equipment_id) AS equipment_count,
-                       COUNT(DISTINCT pi.purchase_item_id) AS po_item_count,
+                       COUNT(DISTINCT CASE WHEN po.po_id IS NOT NULL THEN pi.purchase_item_id END) AS po_item_count,
                        COUNT(DISTINCT nr.ndt_id) AS ndt_count,
                        COUNT(DISTINCT wt.weld_id) AS weld_count,
                        AVG(COALESCE(nr.percent_complete, 0)) AS avg_ndt_pct
@@ -290,13 +299,18 @@ class TraceabilityService:
                    JOIN engineering_disciplines ed ON d.discipline_id = ed.discipline_id
                    LEFT JOIN drawing_materials dm ON d.drawing_id = dm.drawing_id AND d.project_id = dm.project_id
                    LEFT JOIN drawing_equipment de ON d.drawing_id = de.drawing_id AND d.project_id = de.project_id
-                   LEFT JOIN material_takeoff mto ON d.drawing_id = mto.drawing_id
+                   LEFT JOIN material_takeoff mto ON d.drawing_id = mto.drawing_id AND d.project_id = mto.project_id
+                   -- MTO → PO join: purchase_items alone has no project column, so
+                   -- go through procurement_purchase_orders. Without this the same
+                   -- material_type in another project inflated the count.
                    LEFT JOIN purchase_items pi ON mto.material_type = pi.material_type
-                   LEFT JOIN ndt_requests nr ON d.drawing_id = nr.drawing_id
-                   LEFT JOIN weld_tracking wt ON d.drawing_id = wt.drawing_id
+                   LEFT JOIN procurement_purchase_orders po ON pi.po_id = po.po_id AND po.project_id = d.project_id
+                   LEFT JOIN ndt_requests nr ON d.drawing_id = nr.drawing_id AND d.project_id = nr.project_id
+                   LEFT JOIN weld_tracking wt ON d.drawing_id = wt.drawing_id AND d.project_id = wt.project_id
                    WHERE d.project_id = $1
                    GROUP BY d.drawing_id, d.drawing_number, d.drawing_title, ed.discipline_name, d.status, d.issued_for_construction
-                   ORDER BY ed.discipline_name, d.drawing_number""",
-                project_id,
+                   ORDER BY ed.discipline_name, d.drawing_number
+                   LIMIT $2 OFFSET $3""",
+                project_id, page_size, (page - 1) * page_size,
             )
             return [dict(r) for r in matrix]

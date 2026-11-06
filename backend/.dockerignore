@@ -1,0 +1,35 @@
+# Backend build context (backend/) — keep the production image lean and free of
+# local state, secrets, and test-only artifacts.
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+.coverage.*
+
+tests/
+requirements-dev.txt
+
+# Local SQLite / runtime state
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+dev.db*
+
+# Secrets and environment
+.env
+.env.*
+*.pem
+*.key
+
+# Non-runtime files
+*.md
+Dockerfile
+.dockerignore

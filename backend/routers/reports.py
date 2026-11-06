@@ -32,7 +32,8 @@ async def accountability_report(project_id: str, week_end: date, db: AsyncSessio
     manpower = await db.execute(
         text("SELECT report_date, discipline, "
              "ROUND(100.0 * actual_headcount / NULLIF(planned_headcount, 0), 1) AS productivity_pct "
-             "FROM daily_manpower WHERE project_id = :pid AND report_date BETWEEN :ws AND :we"),
+             "FROM daily_manpower WHERE project_id = :pid AND report_date BETWEEN :ws AND :we "
+             "ORDER BY report_date, discipline LIMIT 1000"),
         {"pid": project_id, "ws": week_start, "we": week_end}
     )
     shortages = await db.execute(

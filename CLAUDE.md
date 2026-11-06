@@ -11,7 +11,7 @@ Current size: 18 functional router modules (~131 endpoints) + 5 main.py routes, 
 ## Critical: Two Backend Entry Points
 
 - **`backend/main.py`** — the production/PostgreSQL app. asyncpg pool, auth, middleware, Prometheus, Redis WebSocket PubSub, AI/RAG. This is what Docker and tests target.
-- **`backend/dev_main.py`** — a ~2,100-line **standalone SQLite reimplementation** of the API (own schema, own routers, own AI chat), for zero-dependency demos. It does **not** import the `routers/` modules and will drift from `main.py`. Changes to API behavior generally need to be mirrored here, or the two apps diverge.
+- **`backend/dev_main.py`** — a ~2,500-line **standalone SQLite reimplementation** of the API (own schema, own routers, own AI chat), for zero-dependency demos. It does **not** import the `routers/` modules and will drift from `main.py`. It now enforces JWT auth through `DevAuthMiddleware` (public: login/refresh/logout) and supports admin-only `/api/auth/register`. Changes to API behavior generally need to be mirrored here, or the two apps diverge.
 
 `backend/database.py` is kept only for Alembic/ORM metadata and legacy sessions; the primary pool is `backend/db.py`.
 
@@ -55,15 +55,21 @@ cd frontend; npm run dev
 
 ```powershell
 # Backend — run from backend/ (pytest.ini lives in backend/tests/)
-cd backend; python -m pytest tests/ -v
+cd backend; python -m pytest tests/ -q -m "not live"
 
 # Single test
 cd backend; python -m pytest tests/test_routers/test_auth.py::TestPasswordHashing::test_hash_and_verify -v
 
 # Endpoint connectivity suite — needs a live server on localhost:8080.
-# Start the SQLite backend first (no Docker required), then in another shell:
+# These tests are marked `live` and excluded from the default run.
 cd backend; python dev_main.py
-cd backend; python -m pytest tests/test_endpoint_connectivity.py -v
+cd backend; python -m pytest tests/test_endpoint_connectivity.py -q -m live
+
+# Full gate (backend + connectivity + security smoke + frontend tests/tsc/build)
+.\scripts\verify.ps1
+
+# Security smoke alone (needs dev_main on :8080; admin/dev-admin-password)
+python scripts/security_smoke.py
 
 # Frontend
 cd frontend; npm run test                 # vitest run
@@ -71,19 +77,28 @@ cd frontend; npx vitest run src/__tests__/Dashboard.test.tsx
 cd frontend; npx tsc --noEmit             # note: npm run build runs `tsc -b`
 ```
 
-Test-only dependencies (`pytest`, `pytest-asyncio`, `aiosqlite`) are **not** in `backend/requirements.txt` — install them separately if the test run fails on imports.
+Test-only dependencies live in `backend/requirements-dev.txt` (`pytest`, `pytest-asyncio`, `aiosqlite`, `httpx`, `ruff`, `pip-audit`).
 
 Backend unit tests use a **SQLite in-memory schema** built in `backend/tests/conftest.py` — they do not exercise PostgreSQL-specific SQL (`JSONB`, `gen_random_uuid`, `ROLLUP`). `test_endpoint_connectivity.py` (69 tests) makes real HTTP calls against `dev_main.py` with `PROJECT_ID = "demo-project"`; it passes only while that server is running.
 
 ### Database
 
 ```powershell
-# Postgres via Docker only mounts database/init.sql (14 core tables).
-# Extended/auth/RAG tables require the migrations, applied manually:
+# docker-compose's one-shot `migrate` service applies init.sql and every
+# database/migrations/*.sql in filename order (ledger: schema_migrations).
+docker compose run --rm migrate
+
+# Against an existing Postgres, apply the same files manually in order:
 psql -U fpso_user -d fpso_db -f database/migrations/001_extended_schema.sql
 psql -U fpso_user -d fpso_db -f database/migrations/002_auth_schema.sql
 psql -U fpso_user -d fpso_db -f database/migrations/003_rag_schema.sql
+psql -U fpso_user -d fpso_db -f database/migrations/004_auth_hardening.sql
+psql -U fpso_user -d fpso_db -f database/migrations/005_reliability_constraints.sql
 ```
+
+`001`–`005` are idempotent (guards / `IF NOT EXISTS`) and may be re-run. `004` adds
+`project_members` (row-level authorization). `005` adds `schedule_alerts.entity_id`
+and the partial unique index used by alert dedup, plus hot-join indexes.
 
 There is no `alembic.ini` or `versions/` directory despite Alembic being in requirements; schema changes are plain SQL migration files.
 
@@ -102,8 +117,8 @@ React SPA → Vite proxy :8080 → FastAPI main.py → db.get_pool() (asyncpg) �
 | `config.py` | Pydantic Settings, `FPSO_` prefix; DB/Redis/security, DeepSeek + Anthropic, RAG, LangGraph |
 | `db.py` | **Unified asyncpg pool** — `init_pool()`, `close_pool()`, `get_pool()` dependency. Use this for new code. |
 | `database.py` | SQLAlchemy 2.0 async engine / `get_db()`; legacy + Alembic/ORM metadata only, SQLite fallback when URL is unset |
-| `auth.py` | JWT (HS256, 15-min access / 7-day refresh), bcrypt, role hierarchy `admin > project_manager > trade_lead > viewer`, `get_current_user`, `require_role` |
-| `routers/auth_router.py` | `/api/auth/login`, `/register`, `/refresh`, `/me` |
+| `auth.py` | JWT (HS256, 15-min access / 7-day refresh), bcrypt, role hierarchy `admin > project_manager > trade_lead > viewer`, `get_current_user`, `require_role`, `user_has_project_access`, `bootstrap_admin` |
+| `routers/auth_router.py` | `/api/auth/login`, `/register` (admin only), `/refresh` (atomic rotation + reuse detection), `/logout`, `/logout-all`, `/me` |
 | `errors.py` | `AppError` + `not_found`/`bad_request`/`unauthorized`/`forbidden`/`conflict` factories; `register_error_handlers(app)` produces `{detail, code, context}` |
 | `pagination.py` | `PaginationParams` (`page`, `page_size` ≤ 500), `paginate()`, `PaginatedResponse` (`{items, pagination}`) |
 | `cache.py` | `@cached(ttl_seconds, key_prefix)` Redis-backed decorator, no-op when Redis is unavailable |
@@ -117,6 +132,33 @@ React SPA → Vite proxy :8080 → FastAPI main.py → db.get_pool() (asyncpg) �
 - New routes should use `from db import get_pool` and raw SQL: `pool = Depends(get_pool)` then `async with pool.acquire() as conn:`.
 - **16 routers still use `from database import get_db` / `AsyncSession`** (engineering, procurement, construction, inspection, reports, equipment, completion, commissioning, quality, safety, training, planning, conflict, stagegate, feedback, ai). Do not assume the pool consolidation is complete.
 - ORM models: `backend/models/extended.py` now covers most extended tables (45 models total across `models/`), but there are no `relationship()` definitions and routers mostly bypass the ORM in favor of raw SQL.
+
+### Security model
+
+- **Global authentication:** every feature router is included with
+  `dependencies=[Depends(get_current_user)]`. Public endpoints are login, refresh,
+  health, and the WS handshake. `FPSO_AUTH_ENFORCEMENT=false` is an emergency
+  kill switch that grants a synthetic admin — never use it in production.
+- **Writes:** `WriteRoleGuardMiddleware` rejects `viewer` (and unknown roles) with
+  403 on POST/PUT/PATCH/DELETE; `trade_lead`+ passes. Missing/invalid tokens are
+  left to the route dependency so they still produce a consistent 401.
+- **Project access:** `auth.user_has_project_access` uses `project_members`
+  (migration 004); admins/PMs bypass. A project with no membership rows remains
+  open to authenticated users for backward compatibility.
+- **Bootstrap admin:** created on first startup from
+  `FPSO_BOOTSTRAP_ADMIN_USERNAME` / `FPSO_BOOTSTRAP_ADMIN_PASSWORD` when the
+  users table is empty. Production refuses to start without one, with a short or
+  default `FPSO_SECRET_KEY`, without `FPSO_DATABASE_URL`, or with wildcard CORS
+  (`config.validate_runtime_config`).
+- **Refresh tokens** are opaque, SHA-256-hashed at rest, rotated atomically
+  (`UPDATE ... WHERE revoked=FALSE RETURNING user_id`), and replay revokes the
+  whole family. `POST /api/auth/logout` / `logout-all` revoke explicitly.
+- **WebSocket:** the JWT travels in `Sec-WebSocket-Protocol: bearer.<jwt>` (the
+  frontend sends it). `?token=` is accepted only when
+  `FPSO_ENVIRONMENT=development`. Origin and project access are checked before
+  `manager.connect`; rejection uses close code 1008.
+- The optional `X-API-Key` dependency in `middleware/auth.py` still is **not**
+  installed globally; it is unused by default.
 
 ### AI stack
 
@@ -171,8 +213,12 @@ Key `FPSO_` settings (see `backend/config.py` and `.env.example`):
 | Setting | Default | Notes |
 |---------|---------|-------|
 | `database_url` | `""` | Must be set; `+asyncpg` stripped for the raw pool |
-| `secret_key` | `""` | Empty/`change-me-in-production` disables JWT enforcement for WebSocket (dev bypass) |
-| `cors_origins` | localhost:5173, :3000 | Also used by CSRF checks |
+| `secret_key` | `""` | 32+ random chars required; production fails closed when unset/short/default |
+| `environment` | `development` | `development` / `test` / `production`; production enables fail-closed config |
+| `auth_enforcement` | `true` | Emergency kill switch; `false` grants synthetic admin (never in production) |
+| `bootstrap_admin_username` / `bootstrap_admin_password` | `admin` / `""` | First-startup admin; production requires the password |
+| `trusted_hosts` | `["localhost","127.0.0.1","testserver"]` | `TrustedHostMiddleware`; add the real hostnames for production |
+| `cors_origins` | localhost:5173, :3000 | Also used by CSRF and WS Origin checks |
 | `llm_primary` / `llm_fallback` | `deepseek` / `anthropic` | Multi-LLM routing |
 | `deepseek_model` | `deepseek-chat` | `deepseek_api_key` required |
 | `anthropic_model` | `claude-sonnet-4-20250514` | `anthropic_api_key` required |
@@ -184,20 +230,23 @@ Key `FPSO_` settings (see `backend/config.py` and `.env.example`):
 
 ## Known Issues and Gotchas
 
-1. **Auth is infrastructure, not enforcement.** JWT/RBAC exist, but only `auth_router` and the alert routes in `main.py` depend on `get_current_user`/`require_role`. Feature routers are still unauthenticated, and there is no frontend login screen.
-2. **Two backends drift** (`main.py` vs `dev_main.py`) — see the note at the top. `dev_main.py` also duplicates many router definitions instead of importing them.
-3. **Docker schema gap** — `docker-compose.yml` mounts only `database/init.sql`; migrations `002_auth_schema.sql` and `003_rag_schema.sql` (and often `001`) must be applied manually, or auth/AI endpoints fail at runtime.
-4. **Docker port mismatch** — compose maps frontend `5173:5173`, but the frontend image is nginx listening on `80`; backend compose maps `8000`, while local Vite expects `8080`.
+1. **Authentication is enforced, authorization is coarse.** Every feature router
+   requires a valid JWT and writes require `trade_lead`+. Project-level checks
+   exist (`user_has_project_access`) but most feature endpoints still accept any
+   project ID from an authenticated user; a project is only closed once it has
+   rows in `project_members`.
+2. **Two backends drift** (`main.py` vs `dev_main.py`) — see the note at the top. `dev_main.py` also duplicates many router definitions instead of importing them. It now enforces JWT auth (including a dev-only `/api/auth/register`, admin-only) so the connectivity and smoke suites exercise the real gate.
+3. **Docker schema gap is resolved by the `migrate` service** — compose applies `init.sql` + migrations `001`–`005` and records them in `schema_migrations`. Only the Postgres entrypoint's `init.sql` mount remains for dependency-only startup; run `docker compose run --rm migrate` if you start only Postgres.
+4. **Ports** — compose maps frontend `5173:80` (nginx listens on 80) and backend `8000:8000`; nginx proxies `/api` and `/ws` to `backend:8000`. Local Vite dev expects the backend on `8080` (`dev_main.py` or `uvicorn main:app --port 8080`).
 5. **API-key middleware is not installed** — `verify_api_key` exists but is not added in `main.py`; it only runs if a route declares it.
 6. **Legacy SQLAlchemy sessions** remain in 16 routers (pool consolidation incomplete) and `services/planning_service.py` is dead code.
-7. **No pagination consistency** — `pagination.py` exists, but many list endpoints still accept ad-hoc `page`/`page_size` or return unbounded lists.
-8. **Tests are SQLite-only** and will not catch PostgreSQL-specific failures.
-9. **Not a git repository** — there is no `.git` directory at the project root.
+7. **Pagination is partial** — hot list endpoints now clamp `page_size` ≤ 500 and have LIMITs, but response shapes are still bare lists (`pagination.py` remains largely unused).
+8. **Tests are SQLite-only** and will not catch PostgreSQL-specific failures (`FILTER`, `JSONB`, `ROLLUP`, `gen_random_uuid`, partial-index inference). Migrations `004`/`005` and PostgreSQL SQL were reviewed statically, not executed.
+9. **Git repository** — the project root is a git repository; commit after each green verification gate.
+10. **Demo project ID** — `demo-project` is not a UUID and will fail on PostgreSQL foreign keys. Use a real project UUID for `main.py`; the SQLite dev backend accepts the string.
 
 ## Reference Docs (project root)
 
-- `project_improvement_plan.md` — endpoint inventory and phased remediation plan
-- `FPSO_EPC_Implementation_Guide.md` — full domain/EPC specification
 - `RAG_AI_Assistant_Full_Implementation_Guide.md` — AI/RAG design
 - `Agent_Security_Architecture_v2.md` — security architecture
 - `VALIDATION.md` — validation notes

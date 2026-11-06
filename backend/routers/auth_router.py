@@ -1,24 +1,48 @@
 """
-Auth Router — OAuth2+JWT login, register, refresh, user info.
+Auth Router — OAuth2+JWT login, register, refresh, logout, user info.
+
+Refresh tokens are rotated atomically and hashed at rest. Every authentication
+event is written to ``auth_audit_log``.
 """
 
+import hashlib
 import logging
-from datetime import datetime, timedelta, timezone
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from typing import Optional
+
+from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response, status
+from pydantic import BaseModel
+
 from auth import (
     LoginRequest, RegisterRequest, RefreshRequest,
     TokenResponse, UserInfo,
     verify_password, hash_password, create_access_token, create_refresh_token,
     get_current_user, require_role, TokenData,
     db_get_user_by_username, db_get_user_by_id, db_create_user,
-    db_store_refresh_token, db_revoke_all_user_tokens, db_log_auth_event,
-    REFRESH_TOKEN_EXPIRE_DAYS,
+    db_revoke_refresh_token, db_revoke_all_user_tokens,
+    db_get_refresh_token, db_log_auth_event,
+    REFRESH_TOKEN_EXPIRE_DAYS, DUMMY_PASSWORD_HASH, limiter,
 )
-import hashlib
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+
+class LogoutRequest(BaseModel):
+    refresh_token: Optional[str] = None
+
+
+def _rate_limit(limit_value: str):
+    """Apply a slowapi limit when the limiter is available (no-op otherwise)."""
+    if limiter is None:  # pragma: no cover - slowapi is an optional dependency
+        def _noop(func):
+            return func
+        return _noop
+    return limiter.limit(limit_value)
+
+
+def _client_ip(request: Request) -> Optional[str]:
+    return request.client.host if request.client else None
 
 
 async def get_auth_pool():
@@ -28,6 +52,7 @@ async def get_auth_pool():
 
 
 @router.post("/login", response_model=TokenResponse)
+@_rate_limit("5/minute")
 async def login(req: LoginRequest, request: Request):
     """Authenticate user and return access + refresh tokens."""
     if not req.username or not req.password:
@@ -42,10 +67,15 @@ async def login(req: LoginRequest, request: Request):
     pool = await get_auth_pool()
     user = await db_get_user_by_username(pool, req.username)
 
-    if not user or not verify_password(req.password, user["hashed_password"]):
+    # Always run bcrypt, even for unknown users, to avoid a timing oracle that
+    # would reveal whether a username exists.
+    password_hash = user["hashed_password"] if user else DUMMY_PASSWORD_HASH
+    password_ok = verify_password(req.password, password_hash)
+
+    if not user or not password_ok:
         await db_log_auth_event(
-            pool, user.get("user_id") if user else None,
-            "FAILED_LOGIN", request.client.host if request.client else None,
+            pool, user["user_id"] if user else None,
+            "FAILED_LOGIN", _client_ip(request),
             request.headers.get("user-agent"),
         )
         raise HTTPException(
@@ -54,26 +84,29 @@ async def login(req: LoginRequest, request: Request):
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Create tokens
-    token_data = {"sub": user["user_id"], "username": user["username"], "role": user["role"]}
+    # Create tokens (asyncpg returns UUID objects; JWTs must carry JSON strings)
+    user_id = str(user["user_id"])
+    token_data = {"sub": user_id, "username": user["username"], "role": user["role"]}
     access_token = create_access_token(token_data)
     raw_refresh, refresh_hash = create_refresh_token(token_data)
 
-    # Store refresh token hash
-    expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
-    await db_store_refresh_token(pool, user["user_id"], refresh_hash, expires_at)
-
-    # Update last_login
+    # Store refresh token hash. Expiry is computed by the database so it can
+    # never drift from the `expires_at > NOW()` rotation check.
     async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO refresh_tokens (token_id, user_id, token_hash, expires_at)
+               VALUES (gen_random_uuid(), $1, $2,
+                       NOW() + ($3::int * INTERVAL '1 day'))""",
+            user_id, refresh_hash, REFRESH_TOKEN_EXPIRE_DAYS,
+        )
         await conn.execute(
             "UPDATE users SET last_login = NOW() WHERE user_id = $1",
             user["user_id"],
         )
 
     await db_log_auth_event(
-        pool, user["user_id"], "LOGIN",
-        request.client.host if request.client else None,
-        request.headers.get("user-agent"),
+        pool, user_id, "LOGIN",
+        _client_ip(request), request.headers.get("user-agent"),
     )
 
     return TokenResponse(
@@ -126,7 +159,7 @@ async def register(req: RegisterRequest, _user: TokenData = Depends(require_role
         )
 
     return UserInfo(
-        user_id=user["user_id"],
+        user_id=str(user["user_id"]),
         username=user["username"],
         email=user["email"],
         full_name=user.get("full_name"),
@@ -136,8 +169,14 @@ async def register(req: RegisterRequest, _user: TokenData = Depends(require_role
 
 
 @router.post("/refresh", response_model=TokenResponse)
+@_rate_limit("5/minute")
 async def refresh(req: RefreshRequest, request: Request):
-    """Exchange a refresh token for new access + refresh tokens (token rotation)."""
+    """Exchange a refresh token for new access + refresh tokens (token rotation).
+
+    Rotation is atomic: a single ``UPDATE ... WHERE revoked = FALSE
+    AND expires_at > NOW() RETURNING user_id`` claims the token, so two
+    concurrent requests can never both succeed.
+    """
     if not req.refresh_token or len(req.refresh_token) > 256:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -146,53 +185,102 @@ async def refresh(req: RefreshRequest, request: Request):
 
     token_hash = hashlib.sha256(req.refresh_token.encode()).hexdigest()
     pool = await get_auth_pool()
+    client_ip = _client_ip(request)
+    user_agent = request.headers.get("user-agent")
 
-    # Look up the refresh token
+    rotated: Optional[tuple[dict, str, str]] = None
     async with pool.acquire() as conn:
-        rt_row = await conn.fetchrow(
-            """SELECT rt.user_id, rt.expires_at, u.role, u.username
-               FROM refresh_tokens rt
-               JOIN users u ON rt.user_id = u.user_id
-               WHERE rt.token_hash = $1 AND rt.revoked = FALSE AND u.is_active = TRUE""",
-            token_hash,
-        )
-        if not rt_row:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or revoked refresh token.",
+        async with conn.transaction():
+            claimed = await conn.fetchrow(
+                """UPDATE refresh_tokens
+                   SET revoked = TRUE
+                   WHERE token_hash = $1 AND revoked = FALSE AND expires_at > NOW()
+                   RETURNING user_id""",
+                token_hash,
             )
+            if claimed:
+                user_row = await conn.fetchrow(
+                    """SELECT user_id, username, role
+                       FROM users WHERE user_id = $1 AND is_active = TRUE""",
+                    claimed["user_id"],
+                )
+                if user_row:
+                    user_id = str(user_row["user_id"])
+                    token_data = {
+                        "sub": user_id,
+                        "username": user_row["username"],
+                        "role": user_row["role"],
+                    }
+                    access_token = create_access_token(token_data)
+                    raw_refresh, new_hash = create_refresh_token(token_data)
+                    await conn.execute(
+                        """INSERT INTO refresh_tokens (token_id, user_id, token_hash, expires_at)
+                           VALUES (gen_random_uuid(), $1, $2,
+                                   NOW() + ($3::int * INTERVAL '1 day'))""",
+                        user_id, new_hash, REFRESH_TOKEN_EXPIRE_DAYS,
+                    )
+                    rotated = (dict(user_row), raw_refresh, access_token)
 
-        if rt_row["expires_at"] < datetime.now(timezone.utc):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Refresh token has expired. Please log in again.",
+    if rotated is None:
+        # The token was not claimable. If it exists at all it was already
+        # revoked/expired — treat presentation of a used token as reuse and
+        # revoke the whole family for that user.
+        existing = await db_get_refresh_token(pool, token_hash)
+        if existing and existing.get("user_id"):
+            await db_revoke_all_user_tokens(pool, existing["user_id"])
+            await db_log_auth_event(
+                pool, existing["user_id"], "REFRESH_REUSE", client_ip, user_agent,
             )
-
-        user_id = str(rt_row["user_id"])
-
-        # Revoke the old refresh token (rotation)
-        await conn.execute(
-            "UPDATE refresh_tokens SET revoked = TRUE WHERE token_hash = $1",
-            token_hash,
+            logger.warning("Refresh token reuse detected; revoked all tokens for user %s",
+                           existing["user_id"])
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or revoked refresh token.",
         )
 
-        # Create new tokens
-        token_data = {"sub": user_id, "username": rt_row["username"], "role": rt_row["role"]}
-        access_token = create_access_token(token_data)
-        raw_refresh, new_hash = create_refresh_token(token_data)
-
-        # Store new refresh token
-        expires_at = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
-        await conn.execute(
-            """INSERT INTO refresh_tokens (token_id, user_id, token_hash, expires_at)
-               VALUES (gen_random_uuid(), $1, $2, $3)""",
-            user_id, new_hash, expires_at,
-        )
-
+    user_row, raw_refresh, access_token = rotated
+    await db_log_auth_event(
+        pool, user_row["user_id"], "REFRESH", client_ip, user_agent,
+    )
     return TokenResponse(
         access_token=access_token,
         refresh_token=raw_refresh,
     )
+
+
+@router.post("/logout", status_code=status.HTTP_204_NO_CONTENT)
+async def logout(
+    request: Request,
+    req: Optional[LogoutRequest] = Body(default=None),
+):
+    """Revoke the supplied refresh token (or do nothing when omitted)."""
+    raw_token = req.refresh_token if req else None
+    if raw_token and len(raw_token) <= 256:
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+        pool = await get_auth_pool()
+        existing = await db_get_refresh_token(pool, token_hash)
+        await db_revoke_refresh_token(pool, token_hash)
+        if existing and existing.get("user_id"):
+            await db_log_auth_event(
+                pool, existing["user_id"], "LOGOUT",
+                _client_ip(request), request.headers.get("user-agent"),
+            )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+@router.post("/logout-all", status_code=status.HTTP_204_NO_CONTENT)
+async def logout_all(
+    request: Request,
+    user: TokenData = Depends(get_current_user),
+):
+    """Revoke every refresh token belonging to the current user."""
+    pool = await get_auth_pool()
+    await db_revoke_all_user_tokens(pool, user.user_id)
+    await db_log_auth_event(
+        pool, user.user_id, "LOGOUT_ALL",
+        _client_ip(request), request.headers.get("user-agent"),
+    )
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.get("/me", response_model=UserInfo)
@@ -206,7 +294,7 @@ async def get_me(user: TokenData = Depends(get_current_user)):
             detail="User not found.",
         )
     return UserInfo(
-        user_id=user_row["user_id"],
+        user_id=str(user_row["user_id"]),
         username=user_row["username"],
         email=user_row["email"],
         full_name=user_row.get("full_name"),

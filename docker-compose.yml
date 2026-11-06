@@ -1,55 +1,168 @@
-version: '3.8'
+# =============================================================================
+# FPSO EPC Project Control System — local / single-host deployment
+#
+# Prerequisites: copy .env.example to .env and set at minimum
+#   FPSO_SECRET_KEY                  random value, 32+ characters (a short key or
+#                                    the .env.example placeholder fails closed at
+#                                    startup because FPSO_ENVIRONMENT=production)
+#   FPSO_BOOTSTRAP_ADMIN_PASSWORD    initial admin password
+#   POSTGRES_PASSWORD                strongly recommended; local-dev fallback is
+#                                    "secure_pass"
+#
+# Local development:
+#   docker compose up -d postgres redis          # dependencies only, host ports
+#                                                 # bound to 127.0.0.1
+#   docker compose up -d --build                 # full stack
+#   UI:      http://localhost:5173               (nginx :80 in the container)
+#   API:     http://localhost:8000/api/...       (also proxied via the UI)
+#   Health:  http://localhost:8000/health
+#   Metrics: http://localhost:8000/metrics
+#
+# Schema: the one-shot `migrate` service owns schema application. It runs
+# database/init.sql (only when absent) followed by database/migrations/*.sql in
+# filename order, recording each file in `schema_migrations`. The API starts only
+# after it exits successfully. If you start only postgres/redis for host-side
+# development, run `docker compose run --rm migrate` once to apply migrations.
+# =============================================================================
+
+name: fpso-epc
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
 
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
-      POSTGRES_USER: fpso_user
-      POSTGRES_PASSWORD: secure_pass
-      POSTGRES_DB: fpso_db
+      POSTGRES_USER: ${POSTGRES_USER:-fpso_user}
+      # Local-dev fallback only. Set POSTGRES_PASSWORD in .env for anything
+      # beyond a developer workstation.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secure_pass}
+      POSTGRES_DB: ${POSTGRES_DB:-fpso_db}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./database/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+      # Applied by the postgres entrypoint ONLY when the data directory is
+      # empty. This preserves `docker compose up -d postgres redis` + host-side
+      # uvicorn for local development (migrations 001+ still need the `migrate`
+      # service: `docker compose run --rm migrate`). The `migrate` service is
+      # the authority for everything else and records this file as applied.
+      - ./database/init.sql:/docker-entrypoint-initdb.d/00_init.sql:ro
+    # Host bindings are loopback-only and exist for host-side tooling
+    # (`uvicorn main:app` against localhost:5432). Production deployments
+    # (k8s) do not publish these — see k8s/deployment.yaml.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U fpso_user -d fpso_db"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 10s
+    logging: *default-logging
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    # Loopback-only, local dev / host-side tooling.
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 3s
-      retries: 5
+      retries: 10
+    logging: *default-logging
+
+  # One-shot schema application. Exits 0 only when every file applied cleanly.
+  migrate:
+    image: postgres:16-alpine
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-fpso_user}
+      PGPASSWORD: ${POSTGRES_PASSWORD:-secure_pass}
+      PGDATABASE: ${POSTGRES_DB:-fpso_db}
+      SQL_ROOT: /sql
+    volumes:
+      - ./database:/sql:ro
+      - ./scripts/db-migrate.sh:/usr/local/bin/db-migrate.sh:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/db-migrate.sh"]
+    logging: *default-logging
 
   backend:
-    build: ./backend
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
     environment:
-      FPSO_DATABASE_URL: postgresql+asyncpg://fpso_user:secure_pass@postgres:5432/fpso_db
-      FPSO_REDIS_URL: redis://redis:6379
-      FPSO_CORS_ORIGINS: '["http://localhost:5173","http://localhost:3000"]'
+      FPSO_ENVIRONMENT: ${FPSO_ENVIRONMENT:-production}
+      FPSO_SECRET_KEY: ${FPSO_SECRET_KEY:?set FPSO_SECRET_KEY in .env (see .env.example)}
+      FPSO_BOOTSTRAP_ADMIN_PASSWORD: ${FPSO_BOOTSTRAP_ADMIN_PASSWORD:?set FPSO_BOOTSTRAP_ADMIN_PASSWORD in .env}
+      # NOTE: credentials are interpolated verbatim into the URL. Use a password
+      # without reserved URL characters, or percent-encode them.
+      FPSO_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-fpso_user}:${POSTGRES_PASSWORD:-secure_pass}@postgres:5432/${POSTGRES_DB:-fpso_db}
+      FPSO_REDIS_URL: redis://redis:6379/0
+      FPSO_CORS_ORIGINS: '${FPSO_CORS_ORIGINS:-["http://localhost:5173","http://localhost:3000"]}'
+      FPSO_LOG_FORMAT: ${FPSO_LOG_FORMAT:-json}
+      FPSO_AI_ENABLED: ${FPSO_AI_ENABLED:-false}
+      FPSO_ANTHROPIC_API_KEY: ${FPSO_ANTHROPIC_API_KEY:-}
+      FPSO_DEEPSEEK_API_KEY: ${FPSO_DEEPSEEK_API_KEY:-}
     ports:
+      # Container port is 8000 because frontend/nginx.conf proxies /api and /ws
+      # to backend:8000 over the compose network.
       - "8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      # /health/ready verifies the database and returns 503 when unavailable;
+      # /health/live would only prove the process is up.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging: *default-logging
 
   frontend:
-    build: ./frontend
-    environment:
-      VITE_API_URL: http://localhost:8000
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Bake-time API base URL. Empty means same-origin (/api, /ws) through
+        # the nginx reverse proxy, which is what the container expects.
+        VITE_API_URL: ${VITE_API_URL:-}
+    restart: unless-stopped
     ports:
-      - "5173:5173"
+      # nginx listens on 80 inside the container; host 5173 keeps the
+      # documented developer URL unchanged.
+      - "5173:80"
     depends_on:
-      - backend
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging: *default-logging
 
 volumes:
   postgres_data:
+  redis_data:

@@ -6,8 +6,17 @@ from pydantic import BaseModel
 from datetime import date
 from typing import Optional
 from database import get_db
+from auth import get_current_user, TokenData
 
 router = APIRouter(prefix="/api/quality", tags=["quality"])
+
+MAX_PAGE_SIZE = 500
+
+
+def clamp_page(page: int, page_size: int) -> tuple[int, int]:
+    page = max(1, page)
+    page_size = max(1, min(page_size, MAX_PAGE_SIZE))
+    return page, page_size
 
 
 # ---- Pydantic Schemas ----
@@ -58,7 +67,8 @@ class WeldNDTUpdate(BaseModel):
 # ---- NCR Endpoints ----
 
 @router.post("/ncr/{project_id}")
-async def create_ncr(project_id: str, data: NCRCreate, db: AsyncSession = Depends(get_db)):
+async def create_ncr(project_id: str, data: NCRCreate, db: AsyncSession = Depends(get_db),
+                     user: TokenData = Depends(get_current_user)):
     await db.execute(
         text("""INSERT INTO quality_ncr (ncr_id, project_id, ncr_number, discipline_id,
                  sub_system_id, activity_id, severity, category, description,
@@ -68,7 +78,8 @@ async def create_ncr(project_id: str, data: NCRCreate, db: AsyncSession = Depend
         {"pid": project_id, "num": data.ncr_number, "did": data.discipline_id,
          "ssid": data.sub_system_id, "aid": data.activity_id, "sev": data.severity,
          "cat": data.category, "desc": data.description, "action": data.immediate_action,
-         "by": data.raised_by, "tdate": data.target_closeout_date}
+         # raised_by is identity — never trust the request body.
+         "by": user.username, "tdate": data.target_closeout_date}
     )
     await db.commit()
     return {"status": "created"}
@@ -80,14 +91,17 @@ async def list_ncrs(
     status: Optional[str] = None,
     severity: Optional[str] = None,
     discipline_id: Optional[int] = None,
+    page: int = 1,
+    page_size: int = 500,
     db: AsyncSession = Depends(get_db),
 ):
+    page, page_size = clamp_page(page, page_size)
     query = """SELECT ncr.*, ed.discipline_name, ss.system_code
                FROM quality_ncr ncr
                LEFT JOIN engineering_disciplines ed ON ncr.discipline_id = ed.discipline_id
                LEFT JOIN sub_systems ss ON ncr.sub_system_id = ss.sub_system_id
                WHERE ncr.project_id = :pid"""
-    params = {"pid": project_id}
+    params = {"pid": project_id, "limit": page_size, "offset": (page - 1) * page_size}
     if status:
         query += " AND ncr.status = :st"
         params["st"] = status
@@ -98,21 +112,28 @@ async def list_ncrs(
         query += " AND ncr.discipline_id = :did"
         params["did"] = discipline_id
     query += " ORDER BY CASE ncr.severity WHEN 'CRITICAL' THEN 0 WHEN 'MAJOR' THEN 1 ELSE 2 END, ncr.raised_date DESC"
+    query += " LIMIT :limit OFFSET :offset"
 
     result = await db.execute(text(query), params)
     return [dict(r._mapping) for r in result]
 
 
 @router.patch("/ncr/{project_id}/{ncr_id}")
-async def update_ncr(project_id: str, ncr_id: str, data: NCRUpdate, db: AsyncSession = Depends(get_db)):
+async def update_ncr(project_id: str, ncr_id: str, data: NCRUpdate,
+                     db: AsyncSession = Depends(get_db),
+                     user: TokenData = Depends(get_current_user)):
     updates = []
     params = {"pid": project_id, "ncr_id": ncr_id}
     for field in ["status", "root_cause", "corrective_action", "preventive_action",
-                   "target_closeout_date", "actual_closeout_date", "verified_by"]:
+                   "target_closeout_date", "actual_closeout_date"]:
         val = getattr(data, field, None)
         if val is not None:
             updates.append(f"{field} = :{field}")
             params[field] = val
+    # verified_by is an identity field — derive it from the token.
+    if data.verified_by is not None:
+        updates.append("verified_by = :verified_by")
+        params["verified_by"] = user.username
     if not updates:
         return {"status": "no changes"}
     updates.append("updated_at = NOW()")
@@ -186,14 +207,17 @@ async def list_welds(
     drawing_id: Optional[str] = None,
     status: Optional[str] = None,
     discipline_id: Optional[int] = None,
+    page: int = 1,
+    page_size: int = 500,
     db: AsyncSession = Depends(get_db),
 ):
+    page, page_size = clamp_page(page, page_size)
     query = """SELECT wt.*, ed.discipline_name, d.drawing_number
                FROM weld_tracking wt
                LEFT JOIN engineering_disciplines ed ON wt.discipline_id = ed.discipline_id
-               LEFT JOIN drawings d ON wt.drawing_id = d.drawing_id
+               LEFT JOIN drawings d ON wt.drawing_id = d.drawing_id AND d.project_id = wt.project_id
                WHERE wt.project_id = :pid"""
-    params = {"pid": project_id}
+    params = {"pid": project_id, "limit": page_size, "offset": (page - 1) * page_size}
     if drawing_id:
         query += " AND wt.drawing_id = :did"
         params["did"] = drawing_id
@@ -203,7 +227,7 @@ async def list_welds(
     if discipline_id:
         query += " AND wt.discipline_id = :disc"
         params["disc"] = discipline_id
-    query += " ORDER BY wt.weld_date DESC"
+    query += " ORDER BY wt.weld_date DESC LIMIT :limit OFFSET :offset"
 
     result = await db.execute(text(query), params)
     return [dict(r._mapping) for r in result]

@@ -355,6 +355,28 @@ def get_test_db_conn():
 
 # ── Pytest Fixtures ─────────────────────────────────────────────────
 
+@pytest.fixture(scope="session", autouse=True)
+def dispose_async_engine():
+    """Dispose the lazy SQLAlchemy engine so its aiosqlite worker thread exits.
+
+    Some authorization tests reach a route body with a valid token, which opens
+    a SQLAlchemy AsyncSession. The fallback engine pools an aiosqlite
+    connection, and aiosqlite's worker thread otherwise keeps the pytest
+    process alive after the last test finishes.
+    """
+    yield
+    import asyncio
+
+    from database import engine
+
+    if engine is None:
+        return
+    try:
+        asyncio.run(engine.dispose())
+    except Exception:
+        pass
+
+
 @pytest.fixture(scope="session")
 def db_conn():
     """Session-scoped DB connection for all tests."""

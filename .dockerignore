@@ -1,0 +1,39 @@
+# Root build context — applies only when building from the repository root.
+# The Compose file builds ./backend and ./frontend, each with its own
+# .dockerignore; this file keeps ad-hoc root-context builds small and secret-free.
+
+.git
+.gitignore
+.claude
+.venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.ruff_cache
+.mypy_cache
+node_modules
+dist
+coverage
+.vite
+
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+dev.db*
+
+*.log
+.DS_Store
+Thumbs.db
+.idea
+.vscode
+
+k8s
+*.md

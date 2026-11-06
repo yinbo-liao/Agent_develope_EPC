@@ -7,8 +7,17 @@ from datetime import date
 from typing import Optional
 from database import get_db
 from errors import not_found
+from auth import get_current_user, TokenData
 
 router = APIRouter(prefix="/api/stagegate", tags=["stagegate"])
+
+MAX_PAGE_SIZE = 500
+
+
+def clamp_page(page: int, page_size: int) -> tuple[int, int]:
+    page = max(1, page)
+    page_size = max(1, min(page_size, MAX_PAGE_SIZE))
+    return page, page_size
 
 
 # ---- Pydantic Schemas ----
@@ -65,15 +74,17 @@ async def create_gate(project_id: str, data: StageGateCreate, db: AsyncSession =
 
 
 @router.get("/{project_id}")
-async def list_gates(project_id: str, db: AsyncSession = Depends(get_db)):
+async def list_gates(project_id: str, page: int = 1, page_size: int = 100,
+                     db: AsyncSession = Depends(get_db)):
+    page, page_size = clamp_page(page, page_size)
     result = await db.execute(
         text("""SELECT sg.*,
                        (SELECT COUNT(*) FROM stage_gate_checklist WHERE gate_id = sg.gate_id) AS total_checklist,
                        (SELECT COUNT(*) FROM stage_gate_checklist WHERE gate_id = sg.gate_id AND is_complete = TRUE) AS completed_checklist
                 FROM stage_gates sg
                 WHERE sg.project_id = :pid
-                ORDER BY sg.gate_sequence"""),
-        {"pid": project_id}
+                ORDER BY sg.gate_sequence LIMIT :limit OFFSET :offset"""),
+        {"pid": project_id, "limit": page_size, "offset": (page - 1) * page_size}
     )
     return [dict(r._mapping) for r in result]
 
@@ -116,22 +127,33 @@ async def get_gate_detail(project_id: str, gate_id: str, db: AsyncSession = Depe
 
 
 @router.patch("/{project_id}/{gate_id}")
-async def update_gate(project_id: str, gate_id: str, data: StageGateUpdate, db: AsyncSession = Depends(get_db)):
+async def update_gate(project_id: str, gate_id: str, data: StageGateUpdate,
+                      db: AsyncSession = Depends(get_db),
+                      user: TokenData = Depends(get_current_user)):
     updates = []
     params = {"pid": project_id, "gid": gate_id}
-    for field in ["status", "planned_date", "actual_date", "human_approver", "approver_comments"]:
+    # human_approver is an approval identity — derive it, never trust the body.
+    for field in ["status", "planned_date", "actual_date", "approver_comments"]:
         val = getattr(data, field, None)
         if val is not None:
             updates.append(f"{field} = :{field}")
             params[field] = val
+    if data.human_approver is not None:
+        updates.append("human_approver = :human_approver")
+        params["human_approver"] = user.username
     if data.status == "APPROVED":
         updates.append("approval_date = CURRENT_DATE")
+        if "human_approver = :human_approver" not in updates:
+            updates.append("human_approver = :human_approver")
+            params["human_approver"] = user.username
     if not updates:
         return {"status": "no changes"}
-    await db.execute(
+    result = await db.execute(
         text(f"UPDATE stage_gates SET {', '.join(updates)} WHERE gate_id = :gid AND project_id = :pid"),
         params
     )
+    if result.rowcount == 0:
+        raise not_found("Stage gate", gate_id)
     await db.commit()
     return {"status": "updated"}
 
@@ -140,6 +162,13 @@ async def update_gate(project_id: str, gate_id: str, data: StageGateUpdate, db: 
 
 @router.post("/checklist/{project_id}")
 async def create_checklist_item(project_id: str, data: GateChecklistItemCreate, db: AsyncSession = Depends(get_db)):
+    # The parent gate must belong to the path project.
+    parent = await db.execute(
+        text("SELECT gate_id FROM stage_gates WHERE gate_id = :gid AND project_id = :pid"),
+        {"gid": data.gate_id, "pid": project_id},
+    )
+    if parent.fetchone() is None:
+        raise not_found("Stage gate", data.gate_id)
     await db.execute(
         text("""INSERT INTO stage_gate_checklist (checklist_item_id, gate_id, item_number, category,
                  description, verification_method)
@@ -152,37 +181,51 @@ async def create_checklist_item(project_id: str, data: GateChecklistItemCreate, 
 
 
 @router.patch("/checklist/{project_id}/{checklist_item_id}")
-async def update_checklist_item(project_id: str, checklist_item_id: str, data: GateChecklistItemUpdate, db: AsyncSession = Depends(get_db)):
+async def update_checklist_item(project_id: str, checklist_item_id: str, data: GateChecklistItemUpdate,
+                                db: AsyncSession = Depends(get_db),
+                                user: TokenData = Depends(get_current_user)):
     updates = []
     params = {"pid": project_id, "cid": checklist_item_id}
-    for field in ["is_complete", "verified_by", "evidence_ref", "remarks"]:
+    # verified_by is an identity field — derived from the token.
+    for field in ["is_complete", "evidence_ref", "remarks"]:
         val = getattr(data, field, None)
         if val is not None:
             updates.append(f"{field} = :{field}")
             params[field] = val
+    if data.verified_by is not None or data.is_complete:
+        updates.append("verified_by = :verified_by")
+        params["verified_by"] = user.username
     if data.is_complete:
         updates.append("verified_date = NOW()")
     if not updates:
         return {"status": "no changes"}
 
-    await db.execute(
-        text(f"UPDATE stage_gate_checklist SET {', '.join(updates)} WHERE checklist_item_id = :cid"),
-        params
-    )
-    await db.commit()
+    # Gate update + checklist recalculation in ONE transaction.
+    async with db.begin():
+        result = await db.execute(
+            text(f"UPDATE stage_gate_checklist SET {', '.join(updates)} "
+                 "WHERE checklist_item_id = :cid "
+                 "AND gate_id IN (SELECT gate_id FROM stage_gates WHERE project_id = :pid)"),
+            params
+        )
+        if result.rowcount == 0:
+            raise not_found("Checklist item", checklist_item_id)
 
-    # Recalculate gate checklist_complete_pct
-    await db.execute(
-        text("""UPDATE stage_gates SET checklist_complete_pct = (
-                    SELECT ROUND(100.0 * COUNT(*) FILTER (WHERE is_complete) / NULLIF(COUNT(*), 0), 1)
-                    FROM stage_gate_checklist WHERE gate_id = sg.gate_id
-                )
-                FROM stage_gates sg
-                WHERE sg.gate_id = stage_gate_checklist.gate_id
-                AND stage_gate_checklist.checklist_item_id = :cid"""),
-        {"cid": checklist_item_id}
-    )
-    await db.commit()
+        # The original SQL referenced stage_gate_checklist in FROM but joined it
+        # to the aggregate; this correlated form only needs the gate id.
+        await db.execute(
+            text("""UPDATE stage_gates AS sg
+                    SET checklist_complete_pct = COALESCE((
+                        SELECT ROUND(100.0 * COUNT(*) FILTER (WHERE c.is_complete) / NULLIF(COUNT(*), 0), 1)
+                        FROM stage_gate_checklist c WHERE c.gate_id = sg.gate_id
+                    ), 0)
+                    WHERE sg.gate_id = (
+                        SELECT c2.gate_id FROM stage_gate_checklist c2
+                        WHERE c2.checklist_item_id = :cid
+                    )
+                    AND sg.project_id = :pid"""),
+            {"cid": checklist_item_id, "pid": project_id}
+        )
     return {"status": "updated"}
 
 
@@ -264,10 +307,10 @@ async def run_ai_assessment(project_id: str, gate_id: str, db: AsyncSession = De
     # Calculate weighted total
     ai_score = round(sum(f["score"] * f["weight"] for f in factors.values()), 1)
 
-    # Update the gate's AI score
+    # Update the gate's AI score — project-scoped.
     await db.execute(
-        text("UPDATE stage_gates SET ai_readiness_score = :score WHERE gate_id = :gid"),
-        {"score": ai_score, "gid": gate_id}
+        text("UPDATE stage_gates SET ai_readiness_score = :score WHERE gate_id = :gid AND project_id = :pid"),
+        {"score": ai_score, "gid": gate_id, "pid": project_id}
     )
     await db.commit()
 

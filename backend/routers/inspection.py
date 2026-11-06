@@ -5,8 +5,17 @@ from pydantic import BaseModel
 from datetime import date
 from typing import Optional
 from database import get_db
+from errors import not_found
 
 router = APIRouter(prefix="/api/inspection", tags=["inspection"])
+
+MAX_PAGE_SIZE = 500
+
+
+def clamp_page(page: int, page_size: int) -> tuple[int, int]:
+    page = max(1, page)
+    page_size = max(1, min(page_size, MAX_PAGE_SIZE))
+    return page, page_size
 
 
 class NDTRequestCreate(BaseModel):
@@ -26,6 +35,13 @@ class NDTProgressUpdate(BaseModel):
 
 @router.post("/ndt-request")
 async def create_ndt_request(req: NDTRequestCreate, db: AsyncSession = Depends(get_db)):
+    if req.activity_id:
+        parent = await db.execute(
+            text("SELECT activity_id FROM activities WHERE activity_id = :aid AND project_id = :pid"),
+            {"aid": req.activity_id, "pid": req.project_id},
+        )
+        if parent.fetchone() is None:
+            raise not_found("Activity", req.activity_id)
     result = await db.execute(
         text("INSERT INTO ndt_requests (ndt_id, project_id, activity_id, ndt_method, weld_joint_id, requested_date, acceptance_criteria, technician_name) "
              "VALUES (gen_random_uuid(), :pid, :aid, :method, :weld, COALESCE(:rdate, CURRENT_DATE), :ac, :tech) RETURNING ndt_id"),
@@ -39,15 +55,19 @@ async def create_ndt_request(req: NDTRequestCreate, db: AsyncSession = Depends(g
 
 
 @router.patch("/ndt-progress/{ndt_id}")
-async def update_ndt_progress(ndt_id: str, data: NDTProgressUpdate, db: AsyncSession = Depends(get_db)):
+async def update_ndt_progress(ndt_id: str, data: NDTProgressUpdate,
+                              project_id: Optional[str] = None,
+                              db: AsyncSession = Depends(get_db)):
     pct = max(0.0, min(100.0, data.percent))
-    await db.execute(
-        text("UPDATE ndt_requests SET percent_complete = :pct, result = COALESCE(:res, result), "
+    query = ("UPDATE ndt_requests SET percent_complete = :pct, result = COALESCE(:res, result), "
              "status = CASE WHEN :pct >= 100 THEN 'COMPLETED' ELSE status END, "
              "completed_date = CASE WHEN :pct >= 100 THEN NOW() ELSE completed_date END "
-             "WHERE ndt_id = :nid"),
-        {"pct": pct, "res": data.result, "nid": ndt_id}
-    )
+             "WHERE ndt_id = :nid")
+    params = {"pct": pct, "res": data.result, "nid": ndt_id}
+    if project_id:
+        query += " AND project_id = :proj_pid"
+        params["proj_pid"] = project_id
+    await db.execute(text(query), params)
     await db.commit()
     return {"status": "updated", "percent_complete": pct}
 
@@ -64,12 +84,16 @@ async def get_ndt_summary(project_id: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/ndt-requests/{project_id}")
-async def list_ndt_requests(project_id: str, status: Optional[str] = None, db: AsyncSession = Depends(get_db)):
+async def list_ndt_requests(project_id: str, status: Optional[str] = None,
+                            page: int = 1, page_size: int = 500,
+                            db: AsyncSession = Depends(get_db)):
+    page, page_size = clamp_page(page, page_size)
     query = "SELECT * FROM ndt_requests WHERE project_id = :pid"
-    params = {"pid": project_id}
+    params = {"pid": project_id, "limit": page_size, "offset": (page - 1) * page_size}
     if status:
         query += " AND status = :st"
         params["st"] = status
+    query += " ORDER BY requested_date DESC NULLS LAST LIMIT :limit OFFSET :offset"
     result = await db.execute(text(query), params)
     return [dict(r._mapping) for r in result]
 
@@ -83,10 +107,15 @@ class DailyFocusCreate(BaseModel):
 
 
 @router.get("/daily-focus/{project_id}")
-async def get_daily_focus(project_id: str, focus_date: date, db: AsyncSession = Depends(get_db)):
+async def get_daily_focus(project_id: str, focus_date: date,
+                          page: int = 1, page_size: int = 500,
+                          db: AsyncSession = Depends(get_db)):
+    page, page_size = clamp_page(page, page_size)
     result = await db.execute(
-        text("SELECT * FROM daily_inspection_focus WHERE project_id = :pid AND focus_date = :fdate"),
-        {"pid": project_id, "fdate": focus_date}
+        text("SELECT * FROM daily_inspection_focus WHERE project_id = :pid AND focus_date = :fdate "
+             "ORDER BY priority LIMIT :limit OFFSET :offset"),
+        {"pid": project_id, "fdate": focus_date,
+         "limit": page_size, "offset": (page - 1) * page_size}
     )
     return [dict(r._mapping) for r in result]
 
@@ -104,11 +133,16 @@ async def create_daily_focus(data: DailyFocusCreate, db: AsyncSession = Depends(
 
 
 @router.patch("/daily-focus/{focus_id}")
-async def complete_daily_focus(focus_id: str, achievement_notes: Optional[str] = None, db: AsyncSession = Depends(get_db)):
-    await db.execute(
-        text("UPDATE daily_inspection_focus SET is_achieved = TRUE, achievement_notes = :notes WHERE focus_id = :fid"),
-        {"notes": achievement_notes, "fid": focus_id}
-    )
+async def complete_daily_focus(focus_id: str, achievement_notes: Optional[str] = None,
+                               project_id: Optional[str] = None,
+                               db: AsyncSession = Depends(get_db)):
+    query = ("UPDATE daily_inspection_focus SET is_achieved = TRUE, "
+             "achievement_notes = :notes WHERE focus_id = :fid")
+    params = {"notes": achievement_notes, "fid": focus_id}
+    if project_id:
+        query += " AND project_id = :proj_pid"
+        params["proj_pid"] = project_id
+    await db.execute(text(query), params)
     await db.commit()
     return {"status": "completed"}
 
@@ -116,8 +150,10 @@ async def complete_daily_focus(focus_id: str, achievement_notes: Optional[str] =
 # ── NDT Progress Table (per-drawing breakdown) ──────────────────────────
 
 @router.get("/ndt-progress-table/{project_id}")
-async def get_ndt_progress_table(project_id: str, db: AsyncSession = Depends(get_db)):
+async def get_ndt_progress_table(project_id: str, page: int = 1, page_size: int = 500,
+                                 db: AsyncSession = Depends(get_db)):
     """Returns NDT progress grouped by discipline + method with daily log data."""
+    page, page_size = clamp_page(page, page_size)
     result = await db.execute(
         text("""SELECT ndl.discipline_name, ndl.ndt_method,
                        ndl.rfi_total_length_mm, ndl.ndt_complete_length_mm,
@@ -125,8 +161,9 @@ async def get_ndt_progress_table(project_id: str, db: AsyncSession = Depends(get
                        ndl.log_date, ndl.previous_status, ndl.remarks, ndl.updated_by
                 FROM ndt_daily_log ndl
                 WHERE ndl.project_id = :pid
-                ORDER BY ndl.log_date DESC, ndl.discipline_name, ndl.ndt_method"""),
-        {"pid": project_id}
+                ORDER BY ndl.log_date DESC, ndl.discipline_name, ndl.ndt_method
+                LIMIT :limit OFFSET :offset"""),
+        {"pid": project_id, "limit": page_size, "offset": (page - 1) * page_size}
     )
     return [dict(r._mapping) for r in result]
 
@@ -134,8 +171,10 @@ async def get_ndt_progress_table(project_id: str, db: AsyncSession = Depends(get
 # ── NDT Drawing Register ────────────────────────────────────────────────
 
 @router.get("/ndt-drawing-register/{project_id}")
-async def get_ndt_drawing_register(project_id: str, db: AsyncSession = Depends(get_db)):
+async def get_ndt_drawing_register(project_id: str, page: int = 1, page_size: int = 500,
+                                   db: AsyncSession = Depends(get_db)):
     """Returns all drawings with NDT request counts and completion status."""
+    page, page_size = clamp_page(page, page_size)
     result = await db.execute(
         text("""SELECT d.drawing_number, d.drawing_title, ed.discipline_name,
                        d.status AS drawing_status, d.issued_for_construction,
@@ -144,12 +183,13 @@ async def get_ndt_drawing_register(project_id: str, db: AsyncSession = Depends(g
                        COALESCE(AVG(nr.percent_complete), 0) AS avg_ndt_pct
                 FROM drawings d
                 JOIN engineering_disciplines ed ON d.discipline_id = ed.discipline_id
-                LEFT JOIN ndt_requests nr ON d.drawing_id = nr.drawing_id
+                LEFT JOIN ndt_requests nr ON d.drawing_id = nr.drawing_id AND nr.project_id = d.project_id
                 WHERE d.project_id = :pid
                 GROUP BY d.drawing_id, d.drawing_number, d.drawing_title,
                          ed.discipline_name, d.status, d.issued_for_construction
-                ORDER BY ed.discipline_name, d.drawing_number"""),
-        {"pid": project_id}
+                ORDER BY ed.discipline_name, d.drawing_number
+                LIMIT :limit OFFSET :offset"""),
+        {"pid": project_id, "limit": page_size, "offset": (page - 1) * page_size}
     )
     return [dict(r._mapping) for r in result]
 
