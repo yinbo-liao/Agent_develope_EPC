@@ -432,6 +432,77 @@ class Sweep:
                    lambda rows: any(r.get("drawing_number") == f"SMOKE-DWG-{rid}"
                                     for r in rows))
 
+        # Material records: create + PO status control (engineering team only).
+        material_id = None
+        if drawing_id:
+            material = self.add(Case("create material record", "POST",
+                                     f"/api/engineering/materials/{PROJECT_ID}",
+                                     json_body={"drawing_id": drawing_id,
+                                                "material_type": "Pipe",
+                                                "material_category": "PIPE",
+                                                "piece_mark": f"SMOKE-MAT-{rid}",
+                                                "material_length": 6,
+                                                "material_weight": 12.5,
+                                                "po_status": "Info-AFI"},
+                                     expect={200}))
+            self.assert_result("material record returns id", material,
+                               lambda d: isinstance(d, dict) and d.get("material_id"),
+                               "missing material_id")
+            if isinstance(material.data, dict):
+                material_id = material.data.get("material_id")
+
+            self.check("created material persisted",
+                       f"/api/engineering/materials/{PROJECT_ID}",
+                       lambda d: any(item.get("piece_mark") == f"SMOKE-MAT-{rid}"
+                                     and item.get("total_weight") == 75.0
+                                     for item in d.get("items", [])),
+                       description="material row missing or total_weight != 75.0")
+
+            self.add(Case("viewer cannot create material", "POST",
+                          f"/api/engineering/materials/{PROJECT_ID}",
+                          json_body={"drawing_id": drawing_id,
+                                     "material_type": "Pipe"},
+                          token=self.viewer_token, expect={403}))
+            self.add(Case("material create rejects unknown drawing", "POST",
+                          f"/api/engineering/materials/{PROJECT_ID}",
+                          json_body={"drawing_id": "smoke-missing",
+                                     "material_type": "Pipe"},
+                          expect={404}))
+        else:
+            for name in ("create material record", "viewer cannot create material"):
+                self.add(Case(name, "POST",
+                              f"/api/engineering/materials/{PROJECT_ID}",
+                              skip="drawing create failed"))
+
+        if material_id:
+            self.add(Case("update material PO status", "PATCH",
+                          f"/api/engineering/materials/{PROJECT_ID}/{material_id}/status",
+                          json_body={"po_status": "PO-issued"}, expect={200}))
+            self.check("material status persisted",
+                       f"/api/engineering/materials/{PROJECT_ID}",
+                       lambda d: any(item.get("material_id") == material_id
+                                     and item.get("po_status") == "PO-issued"
+                                     for item in d.get("items", [])),
+                       description="po_status != PO-issued")
+            self.add(Case("material status rejects unknown value", "PATCH",
+                          f"/api/engineering/materials/{PROJECT_ID}/{material_id}/status",
+                          json_body={"po_status": "NOT-A-STATUS"}, expect={400}))
+            self.add(Case("material status rejects unknown material", "PATCH",
+                          f"/api/engineering/materials/{PROJECT_ID}/smoke-missing/status",
+                          json_body={"po_status": "PR-Raised"}, expect={404}))
+            self.add(Case("viewer cannot update material status", "PATCH",
+                          f"/api/engineering/materials/{PROJECT_ID}/{material_id}/status",
+                          json_body={"po_status": "PR-Raised"},
+                          token=self.viewer_token, expect={403}))
+        else:
+            for name in ("update material PO status", "material status persisted",
+                         "material status rejects unknown value",
+                         "material status rejects unknown material",
+                         "viewer cannot update material status"):
+                self.add(Case(name, "PATCH",
+                              f"/api/engineering/materials/{PROJECT_ID}/smoke-missing/status",
+                              skip="material create failed"))
+
         self.add(Case("create mto item", "POST", f"/api/engineering/mto/{PROJECT_ID}",
                       json_body={"discipline_id": 1,
                                  "material_type": f"SMOKE-MTO-{rid}",

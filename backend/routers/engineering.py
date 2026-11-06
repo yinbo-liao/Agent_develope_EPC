@@ -7,6 +7,8 @@ from typing import Optional
 import csv, io, uuid
 from database import get_db
 from pagination import PaginationParams, paginate
+from auth import require_role
+from errors import not_found, bad_request
 
 router = APIRouter(prefix="/api/engineering", tags=["engineering"])
 
@@ -338,6 +340,122 @@ async def delete_material(project_id: str, material_id: str, db: AsyncSession = 
     )
     await db.commit()
     return {"status": "deleted", "material_id": material_id}
+
+
+# ── Material records (engineering team writes) ─────────────────────────
+
+MATERIAL_PO_STATUSES = [
+    "Info-AFI",
+    "Structure-requested",
+    "piping-requested",
+    "PR-Raised",
+    "PO-issued",
+    "Delivered",
+]
+
+
+class MaterialCreate(BaseModel):
+    drawing_id: str
+    material_type: str
+    material_category: Optional[str] = None
+    piece_mark: Optional[str] = None
+    material_grade: Optional[str] = None
+    material_thickness: Optional[str] = None
+    size: Optional[str] = None
+    diameter: Optional[str] = None
+    material_class: Optional[str] = None
+    material_length: Optional[float] = None
+    material_weight: Optional[float] = None
+    total_weight: Optional[float] = None
+    po_status: Optional[str] = None
+
+
+class MaterialStatusUpdate(BaseModel):
+    po_status: str
+
+
+@router.post("/materials/{project_id}", dependencies=[Depends(require_role("trade_lead"))])
+async def create_material(project_id: str, data: MaterialCreate, db: AsyncSession = Depends(get_db)):
+    """Add a material record to a drawing. Requires trade_lead or above."""
+    if data.po_status and data.po_status not in MATERIAL_PO_STATUSES:
+        raise bad_request(f"po_status must be one of {MATERIAL_PO_STATUSES}")
+
+    result = await db.execute(
+        text("""SELECT drw.drawing_number, ed.discipline_name
+                FROM drawings drw
+                JOIN engineering_disciplines ed ON drw.discipline_id = ed.discipline_id
+                WHERE drw.drawing_id = :did AND drw.project_id = :pid"""),
+        {"did": data.drawing_id, "pid": project_id}
+    )
+    drawing = result.fetchone()
+    if not drawing:
+        raise not_found("Drawing", data.drawing_id)
+    disc = drawing._mapping["discipline_name"]
+
+    length = data.material_length or 0
+    unit_weight = data.material_weight or 0
+    total_weight = data.total_weight
+    if total_weight is None:
+        total_weight = round(unit_weight * length, 3)
+
+    result = await db.execute(
+        text("""INSERT INTO drawing_materials
+                (material_id, drawing_id, project_id, piece_mark, material_grade,
+                 material_thickness, material_weight, material_type, size, diameter,
+                 material_length, material_category, total_weight, material_class, po_status)
+                VALUES (gen_random_uuid(), :did, :pid, :pm, :grade, :thk, :uweight, :mtype,
+                        :size, :dia, :len, :cat, :tweight, :mclass, :status)
+                RETURNING material_id"""),
+        {"did": data.drawing_id, "pid": project_id, "pm": data.piece_mark or "-",
+         "grade": data.material_grade, "thk": data.material_thickness, "uweight": unit_weight,
+         "mtype": data.material_type, "size": data.size, "dia": data.diameter, "len": length,
+         "cat": data.material_category or data.material_type, "tweight": total_weight,
+         "mclass": data.material_class, "status": data.po_status}
+    )
+    material_id = result.fetchone()._mapping["material_id"]
+
+    await db.execute(
+        text("""INSERT INTO change_log (log_id, project_id, entity_type, entity_id, action, entity_number, discipline_name)
+                VALUES (gen_random_uuid(), :pid, 'material', :eid, 'create', :enum, :disc)"""),
+        {"pid": project_id, "eid": material_id, "enum": data.piece_mark or "-", "disc": disc}
+    )
+    await db.commit()
+    return {"status": "created", "material_id": str(material_id)}
+
+
+@router.patch("/materials/{project_id}/{material_id}/status",
+              dependencies=[Depends(require_role("trade_lead"))])
+async def update_material_status(project_id: str, material_id: str, data: MaterialStatusUpdate,
+                                 db: AsyncSession = Depends(get_db)):
+    """Change the PO status of a material record. Requires trade_lead or above."""
+    if data.po_status not in MATERIAL_PO_STATUSES:
+        raise bad_request(f"po_status must be one of {MATERIAL_PO_STATUSES}")
+
+    result = await db.execute(
+        text("""SELECT dm.piece_mark, ed.discipline_name
+                FROM drawing_materials dm
+                JOIN drawings drw ON dm.drawing_id = drw.drawing_id
+                JOIN engineering_disciplines ed ON drw.discipline_id = ed.discipline_id
+                WHERE dm.material_id = :mid AND dm.project_id = :pid"""),
+        {"mid": material_id, "pid": project_id}
+    )
+    row = result.fetchone()
+    if not row:
+        raise not_found("Material", material_id)
+    pm = row._mapping["piece_mark"]
+    disc = row._mapping["discipline_name"]
+
+    await db.execute(
+        text("UPDATE drawing_materials SET po_status = :status WHERE material_id = :mid AND project_id = :pid"),
+        {"status": data.po_status, "mid": material_id, "pid": project_id}
+    )
+    await db.execute(
+        text("""INSERT INTO change_log (log_id, project_id, entity_type, entity_id, action, entity_number, discipline_name)
+                VALUES (gen_random_uuid(), :pid, 'material', :eid, 'update', :enum, :disc)"""),
+        {"pid": project_id, "eid": material_id, "enum": pm, "disc": disc}
+    )
+    await db.commit()
+    return {"status": "updated", "material_id": material_id, "po_status": data.po_status}
 
 
 # ── CSV Import: Drawings ───────────────────────────────────────────────

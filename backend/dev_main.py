@@ -146,7 +146,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS change_log (
             log_id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
             entity_type TEXT NOT NULL CHECK(entity_type IN ('drawing', 'material')),
-            entity_id TEXT NOT NULL, action TEXT NOT NULL CHECK(action IN ('create', 'delete')),
+            entity_id TEXT NOT NULL, action TEXT NOT NULL CHECK(action IN ('create', 'update', 'delete')),
             entity_number TEXT, discipline_name TEXT,
             logged_at TEXT DEFAULT (datetime('now'))
         );
@@ -319,6 +319,29 @@ def init_db():
         conn.execute("ALTER TABLE drawing_materials ADD COLUMN mvr_confirmed_at TEXT DEFAULT NULL")
     except sqlite3.OperationalError:
         pass
+    # Migration: older dev databases restricted change_log.action to
+    # create/delete, which rejected status-update logging. Rebuild the table
+    # with the wider constraint (the PostgreSQL schema already allows 'update').
+    change_log_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='change_log'"
+    ).fetchone()
+    if change_log_sql and "'update'" not in change_log_sql[0]:
+        conn.executescript("""
+            DROP INDEX IF EXISTS idx_change_log_project;
+            DROP INDEX IF EXISTS idx_change_log_entity_type;
+            ALTER TABLE change_log RENAME TO change_log_old;
+            CREATE TABLE change_log (
+                log_id TEXT PRIMARY KEY, project_id TEXT NOT NULL,
+                entity_type TEXT NOT NULL CHECK(entity_type IN ('drawing', 'material')),
+                entity_id TEXT NOT NULL, action TEXT NOT NULL CHECK(action IN ('create', 'update', 'delete')),
+                entity_number TEXT, discipline_name TEXT,
+                logged_at TEXT DEFAULT (datetime('now'))
+            );
+            INSERT INTO change_log SELECT * FROM change_log_old;
+            DROP TABLE change_log_old;
+            CREATE INDEX IF NOT EXISTS idx_change_log_project ON change_log(project_id);
+            CREATE INDEX IF NOT EXISTS idx_change_log_entity_type ON change_log(project_id, entity_type);
+        """)
     # Seed disciplines
     for name in ['STRUCTURAL', 'PIPING', 'MECHANICAL', 'ELECTRICAL', 'HVAC']:
         conn.execute("INSERT OR IGNORE INTO engineering_disciplines (discipline_name) VALUES (?)", (name,))
@@ -1019,6 +1042,107 @@ async def delete_material(project_id: str, material_id: str):
         await conn.execute("DELETE FROM drawing_materials WHERE material_id = ? AND project_id = ?", [material_id, project_id])
         await log_change(conn, project_id, "material", material_id, "delete", pm, disc)
     return {"status": "deleted", "material_id": material_id}
+
+
+MATERIAL_PO_STATUSES = [
+    "Info-AFI",
+    "Structure-requested",
+    "piping-requested",
+    "PR-Raised",
+    "PO-issued",
+    "Delivered",
+]
+
+
+class MaterialCreate(BaseModel):
+    drawing_id: str
+    material_type: str
+    material_category: Optional[str] = None
+    piece_mark: Optional[str] = None
+    material_grade: Optional[str] = None
+    material_thickness: Optional[str] = None
+    size: Optional[str] = None
+    diameter: Optional[str] = None
+    material_class: Optional[str] = None
+    material_length: Optional[float] = None
+    material_weight: Optional[float] = None
+    total_weight: Optional[float] = None
+    po_status: Optional[str] = None
+
+
+class MaterialStatusUpdate(BaseModel):
+    po_status: str
+
+
+@eng.post("/materials/{project_id}")
+async def create_material(project_id: str, data: MaterialCreate):
+    """Create a material record for a drawing.
+
+    Engineering-only write: viewer writes are rejected by DevAuthMiddleware.
+    """
+    if data.po_status and data.po_status not in MATERIAL_PO_STATUSES:
+        raise HTTPException(status_code=400, detail=f"po_status must be one of {MATERIAL_PO_STATUSES}")
+
+    async with pool.acquire() as conn:
+        drawing = await conn.fetch(
+            "SELECT drw.drawing_number, ed.discipline_name FROM drawings drw "
+            "JOIN engineering_disciplines ed ON drw.discipline_id = ed.discipline_id "
+            "WHERE drw.drawing_id = ? AND drw.project_id = ?",
+            data.drawing_id, project_id
+        )
+        if not drawing:
+            raise HTTPException(status_code=404, detail="Drawing not found for this project")
+        drawing = drawing[0]
+
+        material_id = uid()
+        length = data.material_length or 0
+        unit_weight = data.material_weight or 0
+        total_weight = data.total_weight
+        if total_weight is None:
+            total_weight = round(unit_weight * length, 3)
+
+        await conn.execute(
+            "INSERT INTO drawing_materials (material_id, drawing_id, project_id, piece_mark, "
+            "material_grade, material_thickness, material_weight, material_type, size, diameter, "
+            "material_length, material_category, total_weight, material_class, po_status) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [material_id, data.drawing_id, project_id, data.piece_mark or "-",
+             data.material_grade, data.material_thickness, unit_weight, data.material_type,
+             data.size, data.diameter, length, data.material_category or data.material_type,
+             total_weight, data.material_class, data.po_status]
+        )
+        await log_change(conn, project_id, "material", material_id, "create",
+                         data.piece_mark or "-", drawing["discipline_name"])
+
+    return {"status": "created", "material_id": material_id}
+
+
+@eng.patch("/materials/{project_id}/{material_id}/status")
+async def update_material_status(project_id: str, material_id: str, data: MaterialStatusUpdate):
+    """Update the PO status of a material record (engineering team only)."""
+    if data.po_status not in MATERIAL_PO_STATUSES:
+        raise HTTPException(status_code=400, detail=f"po_status must be one of {MATERIAL_PO_STATUSES}")
+
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT dm.piece_mark, ed.discipline_name FROM drawing_materials dm "
+            "JOIN drawings drw ON dm.drawing_id = drw.drawing_id "
+            "JOIN engineering_disciplines ed ON drw.discipline_id = ed.discipline_id "
+            "WHERE dm.material_id = ? AND dm.project_id = ?",
+            material_id, project_id
+        )
+        if not rows:
+            raise HTTPException(status_code=404, detail="Material not found for this project")
+        row = rows[0]
+
+        await conn.execute(
+            "UPDATE drawing_materials SET po_status = ? WHERE material_id = ? AND project_id = ?",
+            [data.po_status, material_id, project_id]
+        )
+        await log_change(conn, project_id, "material", material_id, "update",
+                         row["piece_mark"], row["discipline_name"])
+
+    return {"status": "updated", "material_id": material_id, "po_status": data.po_status}
 
 
 @eng.get("/summary/{project_id}")

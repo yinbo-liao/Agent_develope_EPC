@@ -191,7 +191,7 @@ All routers are registered in `main.py`; counts are `@router` decorators per fil
 
 | Router | # | Router | # |
 |--------|---|--------|---|
-| `engineering.py` | 12 | `completion.py` | 8 |
+| `engineering.py` | 14 | `completion.py` | 8 |
 | `inspection.py` | 11 | `conflict.py` | 8 |
 | `training.py` | 13 | `quality.py` | 8 |
 | `construction.py` | 10 | `ai.py` | 7 |

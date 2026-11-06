@@ -76,6 +76,95 @@ test('rejects invalid credentials and stays on the login page', async ({ page })
   expect(pageErrors, `Uncaught page errors: ${pageErrors.join(' | ')}`).toEqual([]);
 });
 
+test('adds a material record and updates its PO status (engineering team)', async ({ page }) => {
+  test.setTimeout(120_000);
+  const { pageErrors, apiFailures } = trackErrors(page);
+  const pieceMark = `E2E-PM-${Date.now()}`;
+  const drawingNumber = 'STR-DWG-001';
+
+  try {
+    await signIn(page);
+    await expect(page).toHaveURL(/\/projects\/demo-project$/);
+
+    await page.getByRole('button', { name: 'Procurement', exact: true }).click();
+    await expect(
+      page.getByRole('heading', { level: 2, name: 'Procurement', exact: true })
+    ).toBeVisible();
+    await expect(
+      page.getByText('Procurement – Material Planning by Discipline')
+    ).toBeVisible();
+
+    // The admin role may write, so the add-material control is visible.
+    await page.getByRole('button', { name: 'Add Material', exact: true }).click();
+
+    await page.locator('#material-drawing').selectOption({ label: drawingNumber });
+    await page.locator('#material-piece-mark').fill(pieceMark);
+    await page.locator('#material-type').fill('Pipe');
+    await page.locator('#material-category').fill('PIPE');
+    await page.locator('#material-length').fill('6');
+    await page.locator('#material-unit-weight').fill('12.5');
+    await page.locator('#material-po-status').selectOption('Info-AFI');
+
+    const createResponse = page.waitForResponse(
+      (response) =>
+        /\/api\/engineering\/materials\/demo-project$/.test(new URL(response.url()).pathname) &&
+        response.request().method() === 'POST',
+      { timeout: 30_000 }
+    );
+    await page.getByRole('button', { name: 'Add Record', exact: true }).click();
+    expect((await createResponse).status()).toBe(200);
+
+    // The new record appears in the per-record PO status table.
+    await expect(page.getByText(pieceMark, { exact: true })).toBeVisible();
+    const statusSelect = page.getByRole('combobox', { name: `PO status for ${pieceMark}` });
+    await expect(statusSelect).toBeVisible();
+    await expect(statusSelect).toHaveValue('Info-AFI');
+
+    const patchResponse = page.waitForResponse(
+      (response) =>
+        /\/api\/engineering\/materials\/demo-project\/[^/]+\/status$/.test(
+          new URL(response.url()).pathname
+        ) && response.request().method() === 'PATCH',
+      { timeout: 30_000 }
+    );
+    await statusSelect.selectOption('PO-issued');
+    expect((await patchResponse).status()).toBe(200);
+
+    // Reload and re-open the drawing to prove the change was persisted.
+    await page.reload();
+    await page.getByRole('button', { name: 'Procurement', exact: true }).click();
+    await page.getByRole('cell', { name: drawingNumber, exact: true }).click();
+    const persistedSelect = page.getByRole('combobox', { name: `PO status for ${pieceMark}` });
+    await expect(persistedSelect).toHaveValue('PO-issued');
+
+    expect(apiFailures, `API 5xx responses: ${apiFailures.join(', ')}`).toEqual([]);
+    expect(pageErrors, `Uncaught page errors: ${pageErrors.join(' | ')}`).toEqual([]);
+  } finally {
+    // Remove the scratch record so repeated runs stay deterministic.
+    const token = await page
+      .evaluate(() => localStorage.getItem('fpso_access_token'))
+      .catch(() => null);
+    if (token) {
+      const headers = { Authorization: `Bearer ${token}` };
+      const list = await page.request.get(
+        '/api/engineering/materials/demo-project?discipline_id=1',
+        { headers }
+      );
+      if (list.ok()) {
+        const body = await list.json();
+        const items = Array.isArray(body) ? body : body.items || [];
+        const created = items.find((item: any) => item.piece_mark === pieceMark);
+        if (created) {
+          await page.request.delete(
+            `/api/engineering/materials/demo-project/${created.material_id}`,
+            { headers }
+          );
+        }
+      }
+    }
+  }
+});
+
 test('signs in, renders every dashboard tab, and logs out', async ({ page }) => {
   test.setTimeout(180_000);
   const { pageErrors, apiFailures } = trackErrors(page);

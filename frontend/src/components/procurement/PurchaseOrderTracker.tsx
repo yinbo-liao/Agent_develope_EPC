@@ -3,7 +3,8 @@ import { useState, useMemo } from 'react';
 import { Card, CardHeader, CardTitle, CardContent } from '../ui/Card';
 import { Badge } from '../ui/Badge';
 import { apiClient } from '../../lib/api-client';
-import { Package, FileText, X } from 'lucide-react';
+import { useOptionalAuth } from '../../auth/context';
+import { Package, FileText, X, Plus, Loader2 } from 'lucide-react';
 
 const PROCUREMENT_DISCIPLINES = [
   { name: 'STRUCTURAL', id: 1, color: '#3b82f6' },
@@ -28,11 +29,57 @@ const MATERIAL_GRADE_ORDER: Record<string, number> = {
   'CS': 0, 'SS': 1, 'DSS': 2, 'CUNI': 3, 'GRE': 4, 'TI': 5,
 };
 
+/** PO statuses accepted by the backend (keep in sync with dev_main.py). */
+const PO_STATUSES = [
+  'Info-AFI',
+  'Structure-requested',
+  'piping-requested',
+  'PR-Raised',
+  'PO-issued',
+  'Delivered',
+] as const;
+
+/** Roles allowed to add material records and change PO status. */
+const ENGINEERING_WRITE_ROLES = ['admin', 'project_manager', 'trade_lead'];
+
+/** Options for a status select; keeps an unrecognised stored value selectable. */
+function statusOptions(current?: string | null): string[] {
+  const base: string[] = [...PO_STATUSES];
+  return current && !base.includes(current) ? [current, ...base] : base;
+}
+
+const EMPTY_MATERIAL_FORM = {
+  drawing_id: '',
+  piece_mark: '',
+  material_category: '',
+  material_type: '',
+  size: '',
+  material_thickness: '',
+  material_grade: '',
+  material_class: '',
+  material_length: '',
+  material_weight: '',
+  total_weight: '',
+  po_status: 'Info-AFI',
+};
+
+type MaterialForm = typeof EMPTY_MATERIAL_FORM;
+
 export function PurchaseOrderTracker({ projectId }: { projectId: string }) {
   const [selectedDiscipline, setSelectedDiscipline] = useState<string>('STRUCTURAL');
   const [selectedDrawingId, setSelectedDrawingId] = useState<string | null>(null);
   const [selectedDrawingNumber, setSelectedDrawingNumber] = useState<string | null>(null);
+  const [showAddForm, setShowAddForm] = useState(false);
+  const [form, setForm] = useState<MaterialForm>(EMPTY_MATERIAL_FORM);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [savingStatusId, setSavingStatusId] = useState<string | null>(null);
+  const [statusError, setStatusError] = useState<string | null>(null);
   const queryClient = useQueryClient();
+  const auth = useOptionalAuth();
+  const canEdit = ENGINEERING_WRITE_ROLES.includes(auth?.user?.role ?? '');
+  const inputCls =
+    'w-full bg-slate-900 border border-slate-700 rounded px-2 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-blue-500';
 
   const { data: drawingsData, isLoading: drawingsLoading } = useQuery({
     queryKey: ['procurement-drawings', projectId, selectedDiscipline],
@@ -44,7 +91,9 @@ export function PurchaseOrderTracker({ projectId }: { projectId: string }) {
     queryFn: () => apiClient.get(`/api/engineering/materials/${projectId}?discipline_id=${disciplineIdFromName(selectedDiscipline)}`),
   });
 
-  const allDrawings: any[] = drawingsData?.data || [];
+  // main.py returns {items, pagination}; dev_main returns a bare list.
+  const rawDrawings = drawingsData?.data;
+  const allDrawings: any[] = Array.isArray(rawDrawings) ? rawDrawings : rawDrawings?.items || [];
   const allMaterials: any[] = materialsData?.data?.items || [];
 
   // Group materials by drawing_id
@@ -67,6 +116,84 @@ export function PurchaseOrderTracker({ projectId }: { projectId: string }) {
       queryClient.invalidateQueries({ queryKey: ['engineering-materials', projectId] });
       queryClient.invalidateQueries({ queryKey: ['engineering-summary', projectId] });
     } catch (err) { console.error('Failed to delete drawing:', err); }
+  };
+
+  const openAddForm = () => {
+    setForm({
+      ...EMPTY_MATERIAL_FORM,
+      drawing_id: selectedDrawingId || allDrawings[0]?.drawing_id || '',
+    });
+    setFormError(null);
+    setShowAddForm(true);
+  };
+
+  const updateForm = (field: keyof MaterialForm, value: string) => {
+    setForm((prev) => ({ ...prev, [field]: value }));
+  };
+
+  const refreshMaterialQueries = () => {
+    queryClient.invalidateQueries({ queryKey: ['procurement-drawings', projectId] });
+    queryClient.invalidateQueries({ queryKey: ['procurement-materials', projectId] });
+    queryClient.invalidateQueries({ queryKey: ['engineering-drawings', projectId] });
+    queryClient.invalidateQueries({ queryKey: ['engineering-materials', projectId] });
+    queryClient.invalidateQueries({ queryKey: ['engineering-summary', projectId] });
+  };
+
+  const handleCreateMaterial = async () => {
+    if (!canEdit || saving) return;
+    if (!form.drawing_id) {
+      setFormError('Select a drawing first.');
+      return;
+    }
+    if (!form.material_type.trim()) {
+      setFormError('Material type is required.');
+      return;
+    }
+    setSaving(true);
+    setFormError(null);
+    const numberOf = (value: string) => (value.trim() === '' ? null : Number(value));
+    try {
+      await apiClient.post(`/api/engineering/materials/${projectId}`, {
+        drawing_id: form.drawing_id,
+        material_type: form.material_type.trim(),
+        material_category: form.material_category.trim() || null,
+        piece_mark: form.piece_mark.trim() || null,
+        material_grade: form.material_grade.trim() || null,
+        material_thickness: form.material_thickness.trim() || null,
+        size: form.size.trim() || null,
+        material_class: form.material_class.trim() || null,
+        material_length: numberOf(form.material_length),
+        material_weight: numberOf(form.material_weight),
+        total_weight: numberOf(form.total_weight),
+        po_status: form.po_status || null,
+      });
+      refreshMaterialQueries();
+      setSelectedDrawingId(form.drawing_id);
+      const drw = allDrawings.find((d: any) => d.drawing_id === form.drawing_id);
+      setSelectedDrawingNumber(drw?.drawing_number ?? null);
+      setShowAddForm(false);
+      setForm(EMPTY_MATERIAL_FORM);
+    } catch (err: any) {
+      setFormError(err?.response?.data?.detail || 'Failed to create material record.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleStatusChange = async (materialId: string, poStatus: string) => {
+    if (!canEdit) return;
+    setSavingStatusId(materialId);
+    setStatusError(null);
+    try {
+      await apiClient.patch(`/api/engineering/materials/${projectId}/${materialId}/status`, {
+        po_status: poStatus,
+      });
+      refreshMaterialQueries();
+    } catch (err: any) {
+      setStatusError(err?.response?.data?.detail || 'Failed to update PO status.');
+    } finally {
+      setSavingStatusId(null);
+    }
   };
 
   // Aggregate materials for summary table (similar to procurement_planning)
@@ -160,6 +287,17 @@ export function PurchaseOrderTracker({ projectId }: { projectId: string }) {
                   <FileText className="h-4 w-4" />
                   Drawing List – {selectedDiscipline}
                   <Badge variant="info">{allDrawings.length} drawings</Badge>
+                  {canEdit && (
+                    <button
+                      onClick={openAddForm}
+                      disabled={allDrawings.length === 0}
+                      className="ml-auto flex items-center gap-1 px-3 py-1.5 text-xs font-medium rounded-lg bg-blue-600 hover:bg-blue-500 disabled:bg-slate-700 disabled:text-slate-500 text-white transition-colors"
+                      title="Add a material record to a drawing"
+                    >
+                      <Plus className="h-3.5 w-3.5" />
+                      Add Material
+                    </button>
+                  )}
                 </h3>
                 {allDrawings.length === 0 ? (
                   <div className="text-slate-500 py-4 text-center text-xs">
@@ -246,6 +384,106 @@ export function PurchaseOrderTracker({ projectId }: { projectId: string }) {
                   </div>
                 )}
               </div>
+
+              {/* Add Material Record (engineering team only) */}
+              {canEdit && showAddForm && (
+                <div className="border border-blue-700/50 bg-blue-950/10 rounded-lg overflow-hidden">
+                  <div className="px-4 py-3 bg-blue-950/30 flex items-center justify-between">
+                    <h3 className="text-sm font-semibold text-blue-300 flex items-center gap-2">
+                      <Plus className="h-4 w-4" />
+                      Add Material Record – {selectedDiscipline}
+                    </h3>
+                    <button
+                      onClick={() => { setShowAddForm(false); setFormError(null); }}
+                      className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-700/50"
+                      title="Cancel"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  </div>
+                  <div className="p-4 space-y-3">
+                    <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                      <div>
+                        <label htmlFor="material-drawing" className="block text-[10px] uppercase tracking-wide text-slate-400 mb-1">Drawing</label>
+                        <select
+                          id="material-drawing"
+                          value={form.drawing_id}
+                          onChange={(e) => updateForm('drawing_id', e.target.value)}
+                          className={inputCls}
+                        >
+                          <option value="">Select drawing…</option>
+                          {allDrawings.map((d: any) => (
+                            <option key={d.drawing_id} value={d.drawing_id}>{d.drawing_number}</option>
+                          ))}
+                        </select>
+                      </div>
+                      <div>
+                        <label htmlFor="material-piece-mark" className="block text-[10px] uppercase tracking-wide text-slate-400 mb-1">Piece Mark</label>
+                        <input id="material-piece-mark" value={form.piece_mark} onChange={(e) => updateForm('piece_mark', e.target.value)} className={inputCls} placeholder="e.g. P-101" />
+                      </div>
+                      <div>
+                        <label htmlFor="material-category" className="block text-[10px] uppercase tracking-wide text-slate-400 mb-1">Material Category</label>
+                        <input id="material-category" value={form.material_category} onChange={(e) => updateForm('material_category', e.target.value)} className={inputCls} placeholder="e.g. Steel Plate" />
+                      </div>
+                      <div>
+                        <label htmlFor="material-type" className="block text-[10px] uppercase tracking-wide text-slate-400 mb-1">Material Type <span className="text-red-400">*</span></label>
+                        <input id="material-type" value={form.material_type} onChange={(e) => updateForm('material_type', e.target.value)} className={inputCls} placeholder="e.g. Pipe" />
+                      </div>
+                      <div>
+                        <label htmlFor="material-size" className="block text-[10px] uppercase tracking-wide text-slate-400 mb-1">Size</label>
+                        <input id="material-size" value={form.size} onChange={(e) => updateForm('size', e.target.value)} className={inputCls} placeholder="e.g. 6 inch" />
+                      </div>
+                      <div>
+                        <label htmlFor="material-thickness" className="block text-[10px] uppercase tracking-wide text-slate-400 mb-1">Thickness</label>
+                        <input id="material-thickness" value={form.material_thickness} onChange={(e) => updateForm('material_thickness', e.target.value)} className={inputCls} placeholder="e.g. 10 mm" />
+                      </div>
+                      <div>
+                        <label htmlFor="material-grade" className="block text-[10px] uppercase tracking-wide text-slate-400 mb-1">Grade</label>
+                        <input id="material-grade" value={form.material_grade} onChange={(e) => updateForm('material_grade', e.target.value)} className={inputCls} placeholder="e.g. CS" />
+                      </div>
+                      <div>
+                        <label htmlFor="material-class" className="block text-[10px] uppercase tracking-wide text-slate-400 mb-1">Material Class</label>
+                        <input id="material-class" value={form.material_class} onChange={(e) => updateForm('material_class', e.target.value)} className={inputCls} placeholder="e.g. A106" />
+                      </div>
+                      <div>
+                        <label htmlFor="material-length" className="block text-[10px] uppercase tracking-wide text-slate-400 mb-1">Length (m)</label>
+                        <input id="material-length" type="number" min="0" step="any" value={form.material_length} onChange={(e) => updateForm('material_length', e.target.value)} className={inputCls} placeholder="0" />
+                      </div>
+                      <div>
+                        <label htmlFor="material-unit-weight" className="block text-[10px] uppercase tracking-wide text-slate-400 mb-1">Unit Weight (kg/m)</label>
+                        <input id="material-unit-weight" type="number" min="0" step="any" value={form.material_weight} onChange={(e) => updateForm('material_weight', e.target.value)} className={inputCls} placeholder="0" />
+                      </div>
+                      <div>
+                        <label htmlFor="material-total-weight" className="block text-[10px] uppercase tracking-wide text-slate-400 mb-1">Total Weight (kg)</label>
+                        <input id="material-total-weight" type="number" min="0" step="any" value={form.total_weight} onChange={(e) => updateForm('total_weight', e.target.value)} className={inputCls} placeholder="auto = unit weight × length" />
+                      </div>
+                      <div>
+                        <label htmlFor="material-po-status" className="block text-[10px] uppercase tracking-wide text-slate-400 mb-1">PO Status</label>
+                        <select id="material-po-status" value={form.po_status} onChange={(e) => updateForm('po_status', e.target.value)} className={inputCls}>
+                          {PO_STATUSES.map((s) => <option key={s} value={s}>{s}</option>)}
+                        </select>
+                      </div>
+                    </div>
+                    {formError && <p className="text-xs text-red-400">{formError}</p>}
+                    <div className="flex justify-end gap-2">
+                      <button
+                        onClick={() => { setShowAddForm(false); setFormError(null); }}
+                        className="px-3 py-1.5 text-xs rounded-lg bg-slate-800 text-slate-300 hover:bg-slate-700"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={handleCreateMaterial}
+                        disabled={saving}
+                        className="flex items-center gap-1 px-4 py-1.5 text-xs font-medium rounded-lg bg-blue-600 hover:bg-blue-500 disabled:bg-slate-700 disabled:text-slate-500 text-white"
+                      >
+                        {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Plus className="h-3.5 w-3.5" />}
+                        {saving ? 'Saving…' : 'Add Record'}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {/* Material Summary for Selected Drawing */}
               <div>
@@ -336,6 +574,64 @@ export function PurchaseOrderTracker({ projectId }: { projectId: string }) {
                               ))}
                             </tbody>
                           </table>
+                        </div>
+                      )}
+
+                      {/* Individual material records – PO status control (engineering team only) */}
+                      {canEdit && drawingMaterials.length > 0 && (
+                        <div className="border-t border-slate-700/50">
+                          <div className="px-4 py-2 bg-slate-900/40 text-[10px] uppercase tracking-wide text-slate-400 flex items-center justify-between">
+                            <span>Material Records – PO Status Control</span>
+                            {savingStatusId && (
+                              <span className="flex items-center gap-1 text-blue-400 normal-case">
+                                <Loader2 className="h-3 w-3 animate-spin" /> Saving…
+                              </span>
+                            )}
+                          </div>
+                          {statusError && <p className="px-4 py-2 text-xs text-red-400">{statusError}</p>}
+                          <div className="overflow-x-auto max-h-64 overflow-y-auto">
+                            <table className="w-full text-sm border-collapse">
+                              <thead>
+                                <tr className="text-left text-xs text-slate-400 border-b border-slate-700">
+                                  <th className="py-2 pl-4 pr-2">Piece Mark</th>
+                                  <th className="py-2 pr-2">Category</th>
+                                  <th className="py-2 pr-2">Type</th>
+                                  <th className="py-2 pr-2">Size</th>
+                                  <th className="py-2 pr-2 text-right">Length (m)</th>
+                                  <th className="py-2 pr-2 text-right">Weight (kg)</th>
+                                  <th className="py-2 pr-4">PO Status</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {drawingMaterials.map((m: any) => (
+                                  <tr key={m.material_id} className="border-b border-slate-800/50 hover:bg-slate-800/20">
+                                    <td className="py-2 pl-4 pr-2 font-mono text-xs text-white">{m.piece_mark || '-'}</td>
+                                    <td className="py-2 pr-2 text-xs text-slate-300">{m.material_category || '-'}</td>
+                                    <td className="py-2 pr-2 text-xs text-slate-300">{m.material_type || '-'}</td>
+                                    <td className="py-2 pr-2 text-xs text-slate-400">{m.size || m.diameter || '-'}</td>
+                                    <td className="py-2 pr-2 font-mono text-xs text-right text-slate-300">{m.material_length ?? 0}</td>
+                                    <td className="py-2 pr-2 font-mono text-xs text-right text-slate-300">{m.total_weight ?? 0}</td>
+                                    <td className="py-2 pr-4">
+                                      <div className="flex items-center gap-2">
+                                        <select
+                                          aria-label={`PO status for ${m.piece_mark || m.material_id}`}
+                                          value={m.po_status || 'Info-AFI'}
+                                          onChange={(e) => handleStatusChange(m.material_id, e.target.value)}
+                                          disabled={savingStatusId === m.material_id}
+                                          className={`${inputCls} w-44`}
+                                        >
+                                          {statusOptions(m.po_status).map((s) => <option key={s} value={s}>{s}</option>)}
+                                        </select>
+                                        {savingStatusId === m.material_id && (
+                                          <Loader2 className="h-3 w-3 animate-spin text-blue-400" />
+                                        )}
+                                      </div>
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
                         </div>
                       )}
 
