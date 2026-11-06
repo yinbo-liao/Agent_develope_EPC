@@ -68,6 +68,12 @@ cd backend; python -m pytest tests/test_endpoint_connectivity.py -q -m live
 # Full gate (backend + connectivity + security smoke + frontend tests/tsc/build)
 .\scripts\verify.ps1
 
+# All-endpoint sweep of the running dev_main (OpenAPI-driven; exit 1 on FAIL)
+python scripts\smoke_all_endpoints.py --base-url http://127.0.0.1:8080 --db backend\dev.db
+
+# Playwright E2E — needs dev_main on :8080; Playwright starts Vite itself
+cd frontend; npm run test:e2e
+
 # Security smoke alone (needs dev_main on :8080; admin/dev-admin-password)
 python scripts/security_smoke.py
 
